@@ -153,6 +153,11 @@ OUTPUT : a new Excel workbook with four sheets:
          - "Large Group Review": every merged group with more than 50 rows -
            usually a sign of a shared junk value (e.g. a fake SSN), worth a
            manual check before trusting the output.
+         - "Dedup removal": every output row dropped by the final, logic-
+           independent dedup safety check - two DIFFERENT merged groups that
+           happened to produce an identical row across EVERY column. Kept
+           here (not just counted) so a dropped row can be reviewed rather
+           than silently discarded.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -1823,9 +1828,13 @@ def main() -> None:
     # person on purpose; this just catches the case where two DIFFERENT
     # groups happened to collapse to an identical row across EVERY column
     # (e.g. two distinct small groups whose merged values are all blank/
-    # identical) and drops the extra copy, keeping the first occurrence.
+    # identical) and drops the extra copy, keeping the first occurrence. The
+    # dropped copies themselves are kept (not just their count) in the
+    # "Dedup removal" sheet, so they're visible/reviewable rather than
+    # silently discarded.
     dup_mask = df_out.duplicated(keep="first")
     n_dupes = int(dup_mask.sum())
+    df_dedup_removed = df_out[dup_mask].reset_index(drop=True)
     if n_dupes:
         df_out = df_out[~dup_mask].reset_index(drop=True)
 
@@ -1860,6 +1869,7 @@ def main() -> None:
         "Junk SSN Review": df_ssn_review,
         "Junk DOB Review": df_dob_review,
         "Large Group Review": df_large_groups,
+        "Dedup removal": df_dedup_removed,
     })
     print(f"  Written. ({time.monotonic() - t0:.1f}s)")
 

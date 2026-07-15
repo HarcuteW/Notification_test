@@ -1,0 +1,10 @@
+# Required to run hc_script.py
+pandas
+numpy
+openpyxl
+pyxlsb
+xlsxwriter
+
+# Optional - not required, but recommended:
+# python-calamine   # much faster Excel reader for large .xlsb/.xlsx files, used automatically if installed
+# pywin32           # only needed to also emit a .xlsb output via Excel COM automation (Windows + local Excel install required)
