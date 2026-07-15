@@ -113,9 +113,18 @@ name in either column. A match is only made on SSN first, and - only when
 no SSN match exists at all - on a shared Employee ID/Driver's License/
 Passport/Email token instead (never on Address alone; Address is appended
 as extra evidence once a match is already found some other way, never used
-to decide it). Whichever named row shares the MOST such identifiers wins;
-a tie between 2+ equally-strong named rows is refused rather than guessed,
-and reported on the "Unknown Name Bridge Review" sheet instead. This is
+to decide it). Whichever named row shares the MOST such identifiers wins.
+A tie between 2+ equally-strong named rows is broken by EVIDENCE: whichever
+tied candidate has the most other identifying fields populated (SSN, DOB,
+and each of Employee ID/Driver's License/Passport/Email that has a real
+value) wins instead - a shared identifier is more likely to genuinely
+belong to the person with a fuller, more corroborated record than to one
+with nothing else on file. Only when the tied candidates are ALSO tied on
+evidence is the merge finally refused rather than guessed, and reported on
+the "Unknown Name Bridge Review" sheet instead. Any row absorbed via this
+evidence tie-break (as opposed to an outright unambiguous single-candidate
+match) is flagged True in the output's trailing "Unknown Row Merged
+(Tie-Break)" column, so it's easy to find and double-check later. This is
 deliberately a POST-build pass over already-merged rows (not another
 LEVEL_ORDER priority level over raw input rows) - see
 bridge_unknown_name_rows() and _merge_unknown_into_named().
@@ -158,6 +167,12 @@ OUTPUT : a new Excel workbook with five sheets:
              genuinely different address goes into a new "Other Address"
              column as one combined string per address, semicolon-joined
              (see address_key_conflict()).
+           - "Unknown Row Merged (Tie-Break)": True only for a row that
+             absorbed a fully-unknown-name row whose match was an EVIDENCE
+             tie-break (2+ named candidates tied on shared identifiers, the
+             richer record won) rather than an outright unambiguous match -
+             worth a quick double-check even though it wasn't ambiguous
+             enough to land on the review sheet below.
          - "Junk SSN Review": every row where a non-blank SSN value was
            ignored as unusable (a masked SSN with too few known digits) - so
            a real-looking SSN that got silently treated as blank doesn't go
@@ -172,9 +187,12 @@ OUTPUT : a new Excel workbook with five sheets:
            manual check before trusting the output.
          - "Unknown Name Bridge Review": every fully-unknown-name row (both
            First and Last Name blank) that had 2+ equally-strong named-row
-           candidates during the Unknown Name Bridge pass above, and was
-           therefore left unmerged rather than guessed at - worth a manual
-           check to decide which (if any) it really belongs to.
+           candidates during the Unknown Name Bridge pass above AND those
+           candidates were still tied on overall evidence (SSN/DOB/ID
+           fields populated) - so there was no principled way to pick a
+           winner - and was therefore left unmerged rather than guessed at.
+           Worth a manual check to decide which (if any) it really belongs
+           to.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -1404,6 +1422,9 @@ def _merge_unknown_into_named(base: dict, extra: dict) -> None:
         [base[COL_SSN], extra[COL_SSN]], [norm_ssn(base[COL_SSN]), norm_ssn(extra[COL_SSN])])
     base["Rows Merged"] = base["Rows Merged"] + extra["Rows Merged"]
     base["Names Differ"] = base["Names Differ"] or extra["Names Differ"]
+    base["Unknown Row Merged (Tie-Break)"] = (
+        base.get("Unknown Row Merged (Tie-Break)", False)
+        or extra.get("Unknown Row Merged (Tie-Break)", False))
 
 
 def bridge_unknown_name_rows(out_rows: list) -> tuple:
@@ -1425,15 +1446,17 @@ def bridge_unknown_name_rows(out_rows: list) -> tuple:
     different) or a genuinely conflicting SSN (both known, different)
     disqualifies a candidate outright, at either tier - the same conflict
     discipline every other rule in this script already applies. If 2+ named
-    rows tie for the best score, the merge is refused (never guessed) and
-    the row is reported instead - see the "Unknown Name Bridge Review"
-    sheet.
+    rows tie for the best score, the tie is broken by EVIDENCE instead of
+    guessed - see _evidence_score() - and the winner is flagged True in the
+    "Unknown Row Merged (Tie-Break)" output column. Only if the tied
+    candidates are ALSO tied on evidence is the merge finally refused, with
+    the row reported instead - see the "Unknown Name Bridge Review" sheet.
 
     Returns (final_rows, review_rows) - final_rows is out_rows with every
     successfully-bridged unknown row folded away; review_rows lists every
     unknown row left unmerged specifically because of a tied/ambiguous best
-    match (a row with NO match at all is simply left standing on its own -
-    nothing to review there)."""
+    match that ALSO tied on evidence (a row with NO match at all is simply
+    left standing on its own - nothing to review there)."""
     is_blank = [is_row_blank_name(r) for r in out_rows]
     set1_idx = [i for i, b in enumerate(is_blank) if not b]
     set2_idx = [i for i, b in enumerate(is_blank) if b]
@@ -1461,6 +1484,18 @@ def bridge_unknown_name_rows(out_rows: list) -> tuple:
         for c in ID_COLS:
             for tok in prof["ids"][c]:
                 id_index[(c, tok)].append(pos)
+
+    def _evidence_score(pos):
+        """How much OTHER identifying info this named candidate has on file
+        - SSN, DOB, and each of Employee ID/Driver's License/Passport/Email
+        that has a real value (0-6 total). Used ONLY to break a tie between
+        2+ candidates that already matched the unknown row equally well -
+        a shared identifier is more plausibly owned by the person with a
+        fuller, more corroborated record than one with nothing else on
+        file, so the richer profile wins instead of refusing outright."""
+        prof = set1_profiles[pos]
+        return (bool(prof["ssn"]) + bool(prof["dob"])
+                + sum(1 for c in ID_COLS if prof["ids"][c]))
 
     absorbed_into = defaultdict(list)   # out_rows index (named) -> [out_rows index (unknown), ...]
     review_rows = []
@@ -1516,14 +1551,28 @@ def bridge_unknown_name_rows(out_rows: list) -> tuple:
 
         best = max(m for _, m in pool)
         winners = sorted(pos for pos, m in pool if m == best)
+        tie_broken = False
         if len(winners) > 1:
-            review_rows.append({
-                "DOCIDs": str(r2.get(COL_DOCID, ""))[:200],
-                "Remarks": f"{len(winners)} equally-strong named-row candidates matched via "
-                           f"{tier_label} - left unmerged, needs manual review",
-            })
-            continue
-        absorbed_into[set1_idx[winners[0]]].append(i2)
+            # Ambiguous on the unknown row's own overlap - break the tie by
+            # which candidate has the MOST other evidence on file, not by
+            # guessing. Only refuse (and report) if that's ALSO tied.
+            best_evidence = max(_evidence_score(pos) for pos in winners)
+            evidence_winners = [pos for pos in winners if _evidence_score(pos) == best_evidence]
+            if len(evidence_winners) == 1:
+                winners = evidence_winners
+                tie_broken = True
+            else:
+                review_rows.append({
+                    "DOCIDs": str(r2.get(COL_DOCID, ""))[:200],
+                    "Remarks": f"{len(winners)} equally-strong named-row candidates matched via "
+                               f"{tier_label}, still tied on overall evidence - left unmerged, "
+                               f"needs manual review",
+                })
+                continue
+        winner_idx = set1_idx[winners[0]]
+        absorbed_into[winner_idx].append(i2)
+        if tie_broken:
+            out_rows[winner_idx]["Unknown Row Merged (Tie-Break)"] = True
 
     consumed = {i2 for lst in absorbed_into.values() for i2 in lst}
     final_rows = []
@@ -1998,6 +2047,7 @@ def main() -> None:
 
             row["Rows Merged"] = 1
             row["Names Differ"] = False
+            row["Unknown Row Merged (Tie-Break)"] = False
             out_rows.append(row)
             continue
 
@@ -2032,6 +2082,7 @@ def main() -> None:
 
         row["Rows Merged"] = len(group_idxs)
         row["Names Differ"] = has_variation(first_vals) or has_variation(last_vals)
+        row["Unknown Row Merged (Tie-Break)"] = False
         out_rows.append(row)
 
     print("Applying Unknown Name Bridge (post-build, before DOCID overflow) ...")
