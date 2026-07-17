@@ -8,7 +8,8 @@ Simple filter/sort pass over a notification CSV export.
      placeholder text "[Unknown]" (case-insensitive).
   3. Sorts the remaining rows ascending by First Name, then Last Name,
      then Social Security Number.
-  4. Writes the result to sample_10K.csv in the current directory.
+  4. Keeps only the first 10,000 rows of that sorted result.
+  5. Writes the result to sample_10K.csv in the current directory.
 
 Run:
     python hc_filter_sample.py
@@ -21,6 +22,7 @@ COL_LAST = "Last Name"
 COL_SSN = "Social Security Number"
 
 OUTPUT_CSV = "sample_10K.csv"
+SAMPLE_SIZE = 10_000
 UNKNOWN_PLACEHOLDER = "[unknown]"
 
 
@@ -38,9 +40,11 @@ def main():
     filtered = df[mask]
 
     sorted_df = filtered.sort_values(by=[COL_FIRST, COL_LAST, COL_SSN], ascending=True)
+    sample_df = sorted_df.head(SAMPLE_SIZE)
 
-    sorted_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"Read {len(df)} rows, kept {len(sorted_df)} after filtering, wrote {OUTPUT_CSV}")
+    sample_df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Read {len(df)} rows, kept {len(sorted_df)} after filtering, "
+          f"wrote {len(sample_df)} rows to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
