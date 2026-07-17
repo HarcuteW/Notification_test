@@ -53,12 +53,25 @@ pipeline is now built as three sequential phases instead of one flat set of
     spurious extra address, and a group can still have have gathered rows
     with 2+ genuinely different real addresses.
 
-    ASSUMPTION - "Tax Identification" (Step 3.5): the input workbook has no
-    column literally named "Tax Identification Number"; the closest existing
-    field is COL_GOVID ("Government-Issued ID Number"), which the old script
-    already collects but never matched on. This version uses COL_GOVID as
-    the Tax Identification match key. If your workbook has a distinct Tax ID
-    column, update TAXID_COL below.
+    "Tax Identification" (Step 3.5) matches on COL_TAXID ("Tax
+    Identification Number"), a real, distinct column in the source data -
+    Government-Issued ID Number (COL_GOVID) remains a separate, purely
+    APPEND-ONLY field (see OTHER_MERGE_COLS), same as it always was.
+
+    Two source columns are handled specially, outside the 5-level cascade:
+      - COL_DOB_ALT ("DOBs", plural) - a secondary/legacy DOB source,
+        confirmed to feed the SAME date evidence as COL_DOB itself, not an
+        independent field. Its value is used for matching (Steps 3.1/3.2)
+        whenever COL_DOB itself is blank, and its raw value is folded into
+        the same dob_merge() call that builds the output DOB display - it
+        never appears as its own output column.
+      - COL_UNIQUE_ID ("Unique_ID") - the source database's own primary
+        key for a row, confirmed NOT to be a person-identity signal (never
+        used for matching). The output simply keeps whichever value was on
+        the FIRST (topmost) original row in a merged group and drops every
+        other row's value - unlike every OTHER_MERGE_COLS field, it is
+        never semicolon-merged (see main()'s Step 4 build loop and
+        _fold_row_into(), which both deliberately exclude it).
 
     ASSUMPTION - Name grouping is an EXACT normalized match (no prefix/
     initial tolerance), taken from the literal "First + Last Name + Suffix
@@ -237,13 +250,30 @@ COL_DL       = "Driver's License Number"
 COL_PASSPORT = "Passport Number"
 COL_GOVID    = "Government-Issued ID Number"
 COL_EMPID    = "Employee Identification Number"
-COL_PHONE    = "Phone Number"
+COL_PHONE    = "Phone Number - Personal"
 COL_EMAIL    = "Email Address - Personal"
+COL_TAXID    = "Tax Identification Number"
 
-# Tax Identification match key (Step 3.5) - see ASSUMPTION note in the
-# module docstring above. Reuses the existing Government-Issued ID Number
-# column; change this if your workbook has a distinct Tax ID field.
-TAXID_COL = COL_GOVID
+# Tax Identification match key (Step 3.5) - a real column in the source
+# data (confirmed against the actual export's headers), not the
+# Government-Issued ID Number workaround this used before that was known.
+TAXID_COL = COL_TAXID
+
+# "DOBs" (plural) - a secondary/legacy DOB source column, confirmed to be
+# used the same way as COL_DOB itself, not an independent field: its values
+# feed the SAME date evidence used for both matching (Step 3.1/3.2's DOB
+# checks) and the output DOB display, and it is NOT a separate output
+# column - see build_records()/main()'s dob_merge() calls.
+COL_DOB_ALT = "DOBs"
+
+# "Unique_ID" - the source database's own primary key for a row, confirmed
+# NOT to be a person-identity signal (rows sharing it aren't necessarily
+# the same confirmed person) - never used for matching. Per row, the
+# MERGED output simply keeps whichever value was on the first (topmost)
+# original row in that merged group and drops every other row's value -
+# never semicolon-merged like OTHER_MERGE_COLS - see main()'s Step 4
+# build loop and _fold_row_into() (deliberately excluded from both).
+COL_UNIQUE_ID = "Unique_ID"
 
 COL_ADDR    = "Residential Address"
 COL_CITY    = "City"
@@ -256,7 +286,7 @@ ADDRESS_COLS = [COL_ADDR, COL_CITY, COL_STATE, COL_PROVINCE, COL_ZIP, COL_COUNTR
 
 # Every other column in the sheet - these get semicolon-merged as-is,
 # regardless of which level (if any) matched. Driver's License, Passport,
-# Government-Issued ID (Tax ID), Employee ID, Phone, and Email are all
+# Government-Issued ID, Tax ID, Employee ID, Phone, and Email are all
 # APPEND-ONLY here now (see Phase 2 in the module docstring) - only SSN,
 # DOB, Driver's License, Passport, and Tax ID also double as match keys.
 OTHER_MERGE_COLS = [
@@ -275,12 +305,12 @@ OTHER_MERGE_COLS = [
     "Government ID Issuing Country",
     "Government- Issued Identification",
     COL_GOVID,
+    COL_TAXID,
     "Health Related Information",
     COL_EMPID,
     "Work-Related Information",
     "Family Information",
     "Financial Account Information",
-    "Student-Related Information",
     "Demographic Information",
     "Biometric Data",
     "PI Notes",
@@ -288,7 +318,8 @@ OTHER_MERGE_COLS = [
 ]
 
 EXPECTED_COLS = (
-    [COL_DOCID, COL_FIRST, COL_LAST, COL_MIDDLE, COL_SUFFIX, COL_DOB, COL_SSN]
+    [COL_DOCID, COL_FIRST, COL_LAST, COL_MIDDLE, COL_SUFFIX, COL_DOB, COL_DOB_ALT,
+     COL_SSN, COL_UNIQUE_ID]
     + ADDRESS_COLS + OTHER_MERGE_COLS
 )
 
@@ -605,20 +636,23 @@ def build_records(df: pd.DataFrame):
     dob_review = []
     col_pos = {c: p for p, c in enumerate(df.columns)}
     values = df.values
-    fi, la, mi, sf, do, ss, dl, pp, tx, ad, ci, st, zp, pv = (
+    fi, la, mi, sf, do, da, ss, dl, pp, tx, ad, ci, st, zp, pv = (
         col_pos[COL_FIRST], col_pos[COL_LAST], col_pos[COL_MIDDLE], col_pos[COL_SUFFIX],
-        col_pos[COL_DOB], col_pos[COL_SSN], col_pos[COL_DL], col_pos[COL_PASSPORT],
-        col_pos[TAXID_COL], col_pos[COL_ADDR], col_pos[COL_CITY], col_pos[COL_STATE],
-        col_pos[COL_ZIP], col_pos[COL_PROVINCE],
+        col_pos[COL_DOB], col_pos[COL_DOB_ALT], col_pos[COL_SSN], col_pos[COL_DL],
+        col_pos[COL_PASSPORT], col_pos[TAXID_COL], col_pos[COL_ADDR], col_pos[COL_CITY],
+        col_pos[COL_STATE], col_pos[COL_ZIP], col_pos[COL_PROVINCE],
     )
     docid_pos = col_pos[COL_DOCID]
 
-    # Vectorized first pass for the whole DOB column (see
-    # _vectorized_dob_fast_pass()) - resolves the common case (a cell that
-    # cleanly matches COL_DOB's own MM/DD/YYYY format) for every row in one
-    # batched call, so the per-row loop below only needs to fall back to a
-    # scalar norm_dob() call for the rows this didn't resolve.
+    # Vectorized first pass for the whole DOB column, and again for its
+    # secondary/legacy source COL_DOB_ALT ("DOBs" - see the module
+    # docstring) - see _vectorized_dob_fast_pass(). Resolves the common
+    # case (a cell that cleanly matches the MM/DD/YYYY format) for every
+    # row in one batched call each, so the per-row loop below only needs
+    # to fall back to a scalar norm_dob() call for the rows this didn't
+    # resolve.
     dob_fast = _vectorized_dob_fast_pass(df[COL_DOB])
+    dob_alt_fast = _vectorized_dob_fast_pass(df[COL_DOB_ALT])
 
     for i in range(len(df)):
         row = values[i]
@@ -629,7 +663,13 @@ def build_records(df: pd.DataFrame):
         r.suffix = norm_name(row[sf])
 
         fast_dob = dob_fast[i]
-        r.dob = fast_dob if fast_dob is not None else norm_dob(row[do])
+        primary_dob = fast_dob if fast_dob is not None else norm_dob(row[do])
+        fast_dob_alt = dob_alt_fast[i]
+        alt_dob = fast_dob_alt if fast_dob_alt is not None else norm_dob(row[da])
+        # COL_DOB_ALT ("DOBs") feeds the SAME date evidence as COL_DOB, not
+        # an independent field (see module docstring) - only used when the
+        # primary column itself has nothing usable.
+        r.dob = primary_dob if primary_dob else alt_dob
 
         ssn_pattern = _ssn_pattern(row[ss])
         r.ssn = _ssn_from_pattern(ssn_pattern)
@@ -656,13 +696,25 @@ def build_records(df: pd.DataFrame):
                 "Remarks": reason,
             })
 
-        dob_reason = classify_dob_issue(row[do], dob_key=r.dob)
+        # Checked independently against EACH source column's own raw text
+        # and own parsed key - a value that got silently treated as blank
+        # in either COL_DOB or COL_DOB_ALT is worth surfacing, regardless
+        # of whether the OTHER column happened to supply a usable r.dob.
+        dob_reason = classify_dob_issue(row[do], dob_key=primary_dob)
         if dob_reason:
             dob_review.append({
                 "DOCID": row[docid_pos],
                 "First Name": row[fi], "Last Name": row[la],
                 "Original DOB": row[do],
                 "Remarks": dob_reason,
+            })
+        dob_alt_reason = classify_dob_issue(row[da], dob_key=alt_dob)
+        if dob_alt_reason:
+            dob_review.append({
+                "DOCID": row[docid_pos],
+                "First Name": row[fi], "Last Name": row[la],
+                "Original DOB": row[da],
+                "Remarks": f"[{COL_DOB_ALT}] {dob_alt_reason}",
             })
     return recs, ssn_review, dob_review
 
@@ -1470,9 +1522,9 @@ def main() -> None:
     col_pos = {c: p for p, c in enumerate(df.columns)}
     semicol_col_pos = [col_pos[c] for c in SEMICOLON_COLS]
     addr_col_pos = [col_pos[c] for c in ADDRESS_COLS]
-    dob_pos, first_pos, last_pos, mid_pos, suffix_pos, ssn_pos = (
-        col_pos[COL_DOB], col_pos[COL_FIRST], col_pos[COL_LAST],
-        col_pos[COL_MIDDLE], col_pos[COL_SUFFIX], col_pos[COL_SSN],
+    dob_pos, dob_alt_pos, first_pos, last_pos, mid_pos, suffix_pos, ssn_pos, unique_id_pos = (
+        col_pos[COL_DOB], col_pos[COL_DOB_ALT], col_pos[COL_FIRST], col_pos[COL_LAST],
+        col_pos[COL_MIDDLE], col_pos[COL_SUFFIX], col_pos[COL_SSN], col_pos[COL_UNIQUE_ID],
     )
 
     for n, group_idxs in enumerate(groups, 1):
@@ -1483,7 +1535,9 @@ def main() -> None:
             rv = values_arr[i]
             rec = recs[i]
             row = {c: semicolon_merge([rv[p]]) for c, p in zip(SEMICOLON_COLS, semicol_col_pos)}
-            row[COL_DOB] = dob_merge([rv[dob_pos]])
+            # COL_DOB_ALT ("DOBs") feeds the same date evidence as COL_DOB
+            # and is never its own output column - see module docstring.
+            row[COL_DOB] = dob_merge([rv[dob_pos], rv[dob_alt_pos]])
             # Reuse the already-normalized fields from build_records() (rec.
             # first/last/mid/suffix/ssn are byte-identical to norm_name()/
             # norm_ssn() on this same raw cell - just computed once already)
@@ -1493,6 +1547,10 @@ def main() -> None:
             row[COL_MIDDLE] = fullest_value([rv[mid_pos]], [rec.mid])
             row[COL_SUFFIX] = fullest_value([rv[suffix_pos]], [rec.suffix])
             row[COL_SSN] = fullest_value([rv[ssn_pos]], [rec.ssn])
+            # Unique_ID is the source DB's own row key, not a person-
+            # identity signal - keep the (only) row's value as-is, never
+            # semicolon-merged - see module docstring.
+            row[COL_UNIQUE_ID] = rv[unique_id_pos]
 
             for c, p in zip(ADDRESS_COLS, addr_col_pos):
                 raw = rv[p]
@@ -1511,7 +1569,9 @@ def main() -> None:
 
         row = {c: semicolon_merge([r[p] for r in sub_rows])
                for c, p in zip(SEMICOLON_COLS, semicol_col_pos)}
-        row[COL_DOB] = dob_merge([r[dob_pos] for r in sub_rows])
+        # COL_DOB_ALT ("DOBs") feeds the same date evidence as COL_DOB
+        # across every row in the group - see module docstring.
+        row[COL_DOB] = dob_merge([r[dob_pos] for r in sub_rows] + [r[dob_alt_pos] for r in sub_rows])
 
         # Same reuse as the singleton path above - sub_recs' fields are
         # already the norm_name()/norm_ssn() result for these exact cells.
@@ -1525,6 +1585,11 @@ def main() -> None:
         row[COL_SUFFIX] = fullest_value(suffix_vals, [rec.suffix for rec in sub_recs])
         ssn_vals = [r[ssn_pos] for r in sub_rows]
         row[COL_SSN] = fullest_value(ssn_vals, [rec.ssn for rec in sub_recs])
+        # Unique_ID: keep the FIRST (topmost) original row's value only -
+        # group_idxs (and therefore sub_rows) is already in ascending
+        # original-row-order, since known_idxs/groups are built by a single
+        # sequential scan - see module docstring/split_unknown_name_rows().
+        row[COL_UNIQUE_ID] = sub_rows[0][unique_id_pos]
 
         majority_addr_values, other_address = split_addresses(values_arr, addr_col_pos, group_idxs)
         for c, v in zip(ADDRESS_COLS, majority_addr_values):
