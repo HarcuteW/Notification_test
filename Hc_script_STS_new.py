@@ -87,22 +87,33 @@ pipeline is now built as three sequential phases instead of one flat set of
         ID is populated.
       - BLANK-ID rows: none of those five fields are populated (only a
         name, and maybe Address/Employee ID/Phone/Email/DOCID).
-    A BLANK-ID row is folded (its Address/Employee ID/Phone/Email/DOCID
-    appended in) into:
+    Every BLANK-ID row in a partition is folded together into ONE combined
+    row FIRST, regardless of how many FILLED rows exist or whether they'll
+    turn out to tie - two blank-ID rows sharing a Name+Suffix have, by
+    definition, no ID evidence that could conflict, so there's no reason to
+    leave several as separate stragglers just because it's unclear which
+    FILLED row (if any) they ultimately belong with. That single combined
+    row is then folded (its Address/Employee ID/Phone/Email/DOCID appended
+    in) into:
       - the partition's one FILLED row, if there is exactly one;
-      - the richest of 2+ FILLED rows (most of the 5 ID fields populated),
-        if they're unambiguous - flagged True in the "Blank-ID Row Merged
-        (Tie-Break)" output column - or left standing alone and reported on
-        the "Ambiguous Name-Group Review" sheet if even that's tied;
-      - each other (all folded into one row), if the partition has NO
-        filled row at all - Name+Suffix alone is the only evidence there
-        is, so nothing is left unmerged in that case.
+      - the best of 2+ FILLED rows, decided in two stages - first by
+        richness (most of the 5 ID fields populated), then, if that ties,
+        by which FILLED row represents the MAJORITY of original rows
+        ("Rows Merged") - a cluster of many corroborating rows sharing one
+        ID field outweighs a same-richness single straggler. A single
+        winner after both stages is unambiguous - flagged True in the
+        "Blank-ID Row Merged (Tie-Break)" output column; if it's STILL tied
+        on both, the combined blank row is left standing alone and reported
+        on the "Ambiguous Name-Group Review" sheet instead of guessed at;
+      - nothing further, if the partition has NO filled row at all - the
+        combined blank row IS the final row, Name+Suffix alone being the
+        only evidence there is.
     ASSUMPTION: the tie-break logic and its review sheet reuse the same
     "richest profile wins, true ties get reported" approach the prior
-    Unknown Name Bridge pass used (see hc_script_unknowns.py) - Address/
-    Employee ID/Phone/Email are NEVER used to decide a fold, only appended
-    after the decision is made, consistent with Step 4's append-only role
-    for those fields.
+    Unknown Name Bridge pass used (see hc_script_unknowns.py), extended
+    with the majority-size second stage - Address/Employee ID/Phone/Email
+    are NEVER used to decide a fold, only appended after the decision is
+    made, consistent with Step 4's append-only role for those fields.
 
 INPUT  : a CSV file (INPUT_CSV below) with the columns listed in
          EXPECTED_COLS below - every column read and written as plain text
@@ -150,10 +161,12 @@ OUTPUT : SIX separate CSV files (CSV has no concept of multiple sheets in
            to parse (so it was treated as blank instead of silently
            dropped).
          - "Large Group Review": every merged group with more than 50 rows.
-         - "Ambiguous Name-Group Review": every blank-ID row that had 2+
-           equally-matched filled-row candidates in Phase 3, still tied on
-           evidence - left unmerged (standing alone in Merged Notification
-           Data) rather than guessed at.
+         - "Ambiguous Name-Group Review": every blank-ID row (already
+           combined with any sibling blank-ID rows sharing its Name+Suffix
+           - see Phase 3) that had 2+ filled-row candidates, still tied
+           after both the evidence-richness AND majority-size tie-breaks -
+           left unmerged (standing alone in Merged Notification Data)
+           rather than guessed at.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
@@ -1295,16 +1308,30 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
     norm_name() - every row in one Phase-2 group already shares this exact
     key, so recomputing it here reconstructs the same partition), then
     within any partition holding 2+ rows:
-      - no FILLED row (none of the 5 ID fields populated on ANY row in the
-        partition): fold every row into one - Name+Suffix alone is the only
-        evidence there is, nothing is left unmerged.
-      - exactly one FILLED row: fold every BLANK-ID row into it.
-      - 2+ FILLED rows: for each BLANK-ID row, fold into whichever FILLED
-        row has the richest evidence (_row_evidence_score()) IF there's a
-        single richest one (flagged True in 'Blank-ID Row Merged (Tie-
-        Break)'); if 2+ FILLED rows are equally rich, leave the BLANK-ID
-        row standing alone and report it on the "Ambiguous Name-Group
-        Review" sheet instead of guessing.
+      - Every BLANK-ID row (none of the 5 ID fields populated) is folded
+        together into ONE combined blank row FIRST, regardless of how many
+        FILLED candidates exist or whether they'll turn out to tie - two
+        blank-ID rows sharing a Name+Suffix have, by definition, no ID
+        evidence that could conflict between them, so there's no reason to
+        ever leave them as separate stragglers (this also means an
+        unresolved/ambiguous case below still reports ONE reviewable row,
+        not N).
+      - no FILLED row anywhere in the partition: that combined blank row
+        IS the final row - Name+Suffix alone is the only evidence there
+        is, nothing is left unmerged.
+      - exactly one FILLED row: fold the combined blank row into it.
+      - 2+ FILLED rows: break the tie in two stages - first by evidence
+        richness (_row_evidence_score(), 0-5 ID fields populated), then,
+        if that ties, by which candidate represents the MAJORITY of
+        original rows ('Rows Merged') - a cluster of many corroborating
+        rows sharing one ID field is stronger evidence of a real identity
+        than a single stray row with a different, equally-"rich" field, so
+        size should decide before falling back to a guess. If there's a
+        single winner after both tie-breaks, fold in (flagged True in
+        'Blank-ID Row Merged (Tie-Break)'); if it's STILL tied on both
+        evidence and size, leave the combined blank row standing alone and
+        report it on the "Ambiguous Name-Group Review" sheet instead of
+        guessing.
 
     Returns (final_rows, review_rows)."""
     groups = defaultdict(list)
@@ -1323,44 +1350,115 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
         if not blank:
             continue   # nothing to fold in this partition
 
+        # Combine every blank-ID row in this partition into one FIRST - see
+        # docstring above. Applies whether or not a filled row even exists.
+        blank_base, blank_rest = blank[0], blank[1:]
+        for i in blank_rest:
+            _fold_row_into(known_rows[blank_base], known_rows[i])
+            absorbed.add(i)
+
         if not filled:
-            # No ID evidence anywhere in this Name+Suffix partition - fold
-            # every row into the first (lowest-index) one.
-            base_i, rest = blank[0], blank[1:]
-            for i in rest:
-                _fold_row_into(known_rows[base_i], known_rows[i])
-                absorbed.add(i)
+            # No ID evidence anywhere in this Name+Suffix partition -
+            # nothing further to do, the combined blank row stands as-is.
             continue
 
         if len(filled) == 1:
-            base_i = filled[0]
-            for i in blank:
-                _fold_row_into(known_rows[base_i], known_rows[i])
-                absorbed.add(i)
+            _fold_row_into(known_rows[filled[0]], known_rows[blank_base])
+            absorbed.add(blank_base)
             continue
 
-        # 2+ filled candidates - evidence tie-break per blank row.
-        scores = {i: _row_evidence_score(known_rows[i]) for i in filled}
-        best = max(scores.values())
-        winners = [i for i in filled if scores[i] == best]
-        for i in blank:
-            if len(winners) == 1:
-                _fold_row_into(known_rows[winners[0]], known_rows[i])
-                known_rows[winners[0]]["Blank-ID Row Merged (Tie-Break)"] = True
-                absorbed.add(i)
-            else:
-                review_rows.append({
-                    "First Name": known_rows[i][COL_FIRST],
-                    "Last Name": known_rows[i][COL_LAST],
-                    "Suffix": known_rows[i].get(COL_SUFFIX, ""),
-                    "DOCIDs": known_rows[i].get(COL_DOCID, ""),
-                    "Remarks": (f"{len(winners)} equally-strong filled candidates share this "
-                                f"Name+Suffix, tied on evidence ({best} of 5 ID fields each) - "
-                                f"left unmerged, needs manual review"),
-                })
+        # 2+ filled candidates - tie-break stage 1: evidence richness.
+        ev_scores = {i: _row_evidence_score(known_rows[i]) for i in filled}
+        best_ev = max(ev_scores.values())
+        ev_winners = [i for i in filled if ev_scores[i] == best_ev]
+
+        # Tie-break stage 2 (only if stage 1 didn't decide it): prefer the
+        # candidate with the most original rows already merged into it -
+        # the majority cluster outweighs a same-richness straggler.
+        if len(ev_winners) > 1:
+            size_scores = {i: known_rows[i]["Rows Merged"] for i in ev_winners}
+            best_size = max(size_scores.values())
+            winners = [i for i in ev_winners if size_scores[i] == best_size]
+        else:
+            winners = ev_winners
+
+        if len(winners) == 1:
+            _fold_row_into(known_rows[winners[0]], known_rows[blank_base])
+            known_rows[winners[0]]["Blank-ID Row Merged (Tie-Break)"] = True
+            absorbed.add(blank_base)
+        else:
+            review_rows.append({
+                "First Name": known_rows[blank_base][COL_FIRST],
+                "Last Name": known_rows[blank_base][COL_LAST],
+                "Suffix": known_rows[blank_base].get(COL_SUFFIX, ""),
+                "DOCIDs": known_rows[blank_base].get(COL_DOCID, ""),
+                "Remarks": (f"{len(winners)} equally-strong filled candidates share this "
+                            f"Name+Suffix, tied on evidence ({best_ev} of 5 ID fields each) "
+                            f"and on merged-row count ({size_scores[winners[0]]} rows each) - "
+                            f"left unmerged, needs manual review"),
+            })
 
     final_rows = [row for i, row in enumerate(known_rows) if i not in absorbed]
     return final_rows, review_rows
+
+
+# ------------------------------------------------------------
+# 7d) Final output column order - grouped by ROLE in the workflow rather
+#     than mirroring the raw input file's column order, so a reviewer can
+#     see at a glance what actually drove a match vs. what was just
+#     appended along the way.
+# ------------------------------------------------------------
+# Name/Suffix - the Phase 2 partition key itself, always first.
+_NAME_COLS = [COL_FIRST, COL_MIDDLE, COL_LAST, COL_SUFFIX]
+# The 5-level merge cascade's OWN evidence fields, in the SAME priority
+# order as Steps 3.1-3.5 (LEVEL_ORDER) - SSN first, Tax ID last.
+_MERGE_STEP_COLS = [COL_SSN, COL_DOB, COL_DL, COL_PASSPORT, TAXID_COL]
+# Append-only contact/ID fields (Step 4) - never used to decide a match,
+# only carried along once one is found some other way.
+_CONTACT_ID_COLS = [COL_EMPID, COL_PHONE, COL_EMAIL]
+# Meta/derived columns describing the merge itself, not source data.
+_META_COLS = ["Rows Merged", "Names Differ", "Blank-ID Row Merged (Tie-Break)"]
+
+
+def _merged_output_column_order(df_out_cols, docid_extra_cols) -> list:
+    """Returns the column order for the 'Merged Notification Data' output:
+      1. Name + Suffix (the Phase 2 partition key)
+      2. The merge cascade's own evidence fields, in cascade order (SSN,
+         DOB, Driver's License, Passport, Tax ID)
+      3. Address (majority address, then "Other Address") - not a match
+         key anymore, but still identity-adjacent
+      4. Append-only contact/ID fields (Employee ID, Phone, Email)
+      5. DOCID, plus any "DOCID 2", "DOCID 3", ... overflow columns
+      6. Every remaining append-only column (OTHER_MERGE_COLS, in their
+         existing relative order) - the fields that never influence a
+         match at all
+      7. Unique_ID (first-row passthrough - see module docstring)
+      8. Meta/derived columns (Rows Merged, Names Differ, Blank-ID Row
+         Merged (Tie-Break))
+    Only columns actually present in df_out_cols are included - this is
+    just a preference ORDER, not a schema, so it's safe even if a column
+    list changes later."""
+    present = set(df_out_cols)
+    placed = (set(_NAME_COLS) | set(_MERGE_STEP_COLS) | set(ADDRESS_COLS)
+              | {"Other Address"} | set(_CONTACT_ID_COLS) | {COL_DOCID}
+              | set(docid_extra_cols) | {COL_UNIQUE_ID} | set(_META_COLS))
+    remaining_append_cols = [c for c in OTHER_MERGE_COLS if c not in placed and c in present]
+
+    order = []
+    order += [c for c in _NAME_COLS if c in present]
+    order += [c for c in _MERGE_STEP_COLS if c in present]
+    order += [c for c in ADDRESS_COLS if c in present]
+    if "Other Address" in present:
+        order.append("Other Address")
+    order += [c for c in _CONTACT_ID_COLS if c in present]
+    if COL_DOCID in present:
+        order.append(COL_DOCID)
+        order += [c for c in docid_extra_cols if c in present]
+    order += remaining_append_cols
+    if COL_UNIQUE_ID in present:
+        order.append(COL_UNIQUE_ID)
+    order += [c for c in _META_COLS if c in present]
+    return order
 
 
 # ------------------------------------------------------------
@@ -1631,17 +1729,7 @@ def main() -> None:
     df_out = pd.DataFrame(known_rows)
 
     docid_extra_cols = [f"{COL_DOCID} {i}" for i in range(2, max_docid_cols + 1)]
-    input_order = list(df.columns)
-    extra_cols = [c for c in df_out.columns if c not in input_order and c not in docid_extra_cols]
-    new_order = []
-    for c in input_order:
-        if c not in df_out.columns:
-            continue
-        new_order.append(c)
-        if c == COL_DOCID:
-            new_order.extend(docid_extra_cols)
-    new_order.extend(extra_cols)
-    df_out = df_out[new_order]
+    df_out = df_out[_merged_output_column_order(df_out.columns, docid_extra_cols)]
 
     # Final safety-net check ONLY - catches two different groups that
     # collapsed to an identical row across every column.
