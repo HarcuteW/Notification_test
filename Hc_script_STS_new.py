@@ -248,7 +248,7 @@ def progress(label: str, current: int, total: int, extra: str = "") -> None:
 # ------------------------------------------------------------
 # 1) CONFIG - edit these to match your workbook
 # ------------------------------------------------------------
-INPUT_CSV  = "Cng Notification_Final_updated.csv"
+INPUT_CSV  = "sample_10K.csv"
 OUTPUT_CSV = "STS notification merge output.csv"
 
 COL_DOCID  = "DOCIDs"
