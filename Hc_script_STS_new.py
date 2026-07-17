@@ -136,14 +136,15 @@ INPUT  : a CSV file (INPUT_CSV below) with the columns listed in
          EXPECTED_COLS below - every column read and written as plain text
          (dtype=str), so a leading zero in a ZIP/ID or a masked SSN like
          '123-45-XXXX' is never silently reinterpreted as a number.
-OUTPUT : SIX separate CSV files (CSV has no concept of multiple sheets in
-         one file, so each of the old workbook's sheets is now its own
-         file - see _sheet_csv_path()): OUTPUT_CSV itself is "Merged
-         Notification Data"; the other five are written alongside it as
-         "<OUTPUT_CSV base name> - <sheet name>.csv" -
-         "STS notification merge output - Unknown_Entries.csv", etc.
-         - "Merged Notification Data" (OUTPUT_CSV): ONE ROW PER CONFIRMED
-           PERSON (known-name rows only - see Unknown_Entries below).
+OUTPUT : ONE workbook (OUTPUT_XLSB below), with the six sheets below each
+         as their own tab - written as an intermediate .xlsx (no Python
+         library can write .xlsb directly) then converted to .xlsb via
+         Excel COM automation, see _write_workbook()/_convert_to_xlsb().
+         If that conversion isn't possible (pywin32 not installed, or no
+         local Excel install - Windows only), the .xlsx is kept and
+         reported as the real output instead - see main().
+         - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON
+           (known-name rows only - see Unknown_Entries below).
            - First Name, Middle Name, Last Name, Suffix, and SSN: the
              single fullest/most complete value among the merged rows.
            - DOB: every distinct real date seen, "; "-joined, formatted
@@ -153,11 +154,11 @@ OUTPUT : SIX separate CSV files (CSV has no concept of multiple sheets in
              deduplicated and "; "-joined (cells may already contain
              multiple semicolon-joined tokens - see parse_id_tokens()).
            - Every OTHER column (DOCIDs, Phone, Email, etc.): every
-             distinct value seen, "; "-joined. DOCIDs still spills into
+             distinct value seen, "; "-joined. DOCIDs spills into
              "DOCIDs 2", "DOCIDs 3", ... columns past DOCID_CHUNK_SIZE
-             characters (see split_docid_chunks()) - CSV itself has no
-             per-cell limit, but this output is routinely opened in Excel,
-             which does (32,767 chars/cell), so the safeguard stays.
+             characters (see split_docid_chunks()) - Excel truncates a
+             cell past 32,767 characters, so this keeps every DOCID
+             intact and visible instead.
            - Address fields: the majority address stays in the normal
              columns (gaps filled from another row's fuller copy of the
              SAME address); every other distinct address goes into "Other
@@ -195,7 +196,11 @@ License, Passport, or Tax ID - instead of comparing every row to every
 other row).
 
 Install once:
-    pip install pandas numpy
+    pip install pandas numpy xlsxwriter
+    pip install pywin32   # optional - only needed to also emit a .xlsb
+                           # output (Excel COM automation; Windows + a
+                           # local Excel install required); without it,
+                           # the intermediate .xlsx is kept as the output
 
 Run:
     python Hc_script_STS_new.py
@@ -266,7 +271,15 @@ def progress(label: str, current: int, total: int, extra: str = "") -> None:
 # 1) CONFIG - edit these to match your workbook
 # ------------------------------------------------------------
 INPUT_CSV  = "sample_10K.csv"
-OUTPUT_CSV = "STS notification merge output.csv"
+# Single output workbook, one tab per sheet below (see _write_workbook()).
+# Writing .xlsb directly isn't possible with any Python library (pandas/
+# openpyxl/xlsxwriter/pyxlsb only ever WRITE .xlsx) - this writes a
+# .xlsx first, then converts THAT to .xlsb via Excel COM automation (see
+# _convert_to_xlsb() - requires pywin32 + a local Excel install, Windows
+# only), deleting the intermediate .xlsx once the .xlsb exists. If either
+# pywin32 or Excel itself isn't available, the .xlsx is kept and reported
+# as the real output instead - see main().
+OUTPUT_XLSB = "STS notification merge output.xlsb"
 
 COL_DOCID  = "DOCIDs"
 COL_FIRST  = "First Name"
@@ -354,6 +367,7 @@ EXPECTED_COLS = (
 )
 
 MERGE_SEP = "; "
+EXCEL_MAX_ROWS = 1_048_576   # a real constraint again now that output is .xlsx/.xlsb
 
 NAME_PLACEHOLDERS = {
     "UNKNOWN", "UNK", "UNKN", "NA", "NONE", "NULL", "NIL",
@@ -1793,21 +1807,37 @@ def main() -> None:
     df_unknown_entries = pd.DataFrame(unknown_rows)
     df_ambiguous_review = pd.DataFrame(ambiguous_review)
 
-    print(f"Writing {OUTPUT_CSV} and its companion review CSVs ...")
-    t0 = time.monotonic()
-    written_paths = _write_outputs(OUTPUT_CSV, {
+    sheets = {
         "Merged Notification Data": df_out,
         "Unknown_Entries": df_unknown_entries,
         "Junk SSN Review": df_ssn_review,
         "Junk DOB Review": df_dob_review,
         "Large Group Review": df_large_groups,
         "Ambiguous Name-Group Review": df_ambiguous_review,
-    })
+    }
+
+    # Writing .xlsb directly isn't possible with any Python library - write
+    # an intermediate .xlsx (multi-sheet, one tab per entry above) first,
+    # then convert THAT to the real .xlsb output via Excel COM automation.
+    temp_xlsx = os.path.splitext(OUTPUT_XLSB)[0] + ".xlsx"
+    print(f"Writing {temp_xlsx} ...")
+    t0 = time.monotonic()
+    _write_workbook(temp_xlsx, sheets)
     print(f"  Written. ({time.monotonic() - t0:.1f}s)")
 
-    print(f"Done -> {len(written_paths)} file(s) written:")
-    for p in written_paths:
-        print(f"  {p}")
+    print(f"Converting to {OUTPUT_XLSB} ...")
+    t0 = time.monotonic()
+    if _convert_to_xlsb(temp_xlsx, OUTPUT_XLSB):
+        os.remove(temp_xlsx)
+        print(f"  {OUTPUT_XLSB} written. ({time.monotonic() - t0:.1f}s)")
+        print(f"Done -> {OUTPUT_XLSB} "
+              f"({sum(len(df) for df in sheets.values()):,} rows across "
+              f"{len(sheets)} tabs).")
+    else:
+        print(f"Done -> {temp_xlsx} "
+              f"({sum(len(df) for df in sheets.values()):,} rows across "
+              f"{len(sheets)} tabs) - see the message above for why the "
+              f".xlsb conversion didn't run.")
     print("Reminder: save the output only to the secured/authorized folder for "
           "this data - never a desktop or personal drive. It contains SSN, "
           "DOB, and other PII/PHI.")
@@ -1815,32 +1845,60 @@ def main() -> None:
           f"(start to end).")
 
 
-def _sheet_csv_path(base_path: str, sheet: str) -> str:
-    """Derives a companion CSV path for a given output 'sheet' from
-    OUTPUT_CSV - e.g. 'output.csv' -> 'output - Junk SSN Review.csv'. The
-    main "Merged Notification Data" sheet is written to base_path itself,
-    unchanged - see _write_outputs()."""
-    if sheet == "Merged Notification Data":
-        return base_path
-    root, ext = os.path.splitext(base_path)
-    return f"{root} - {sheet}{ext or '.csv'}"
+def _write_workbook(path: str, sheets: dict) -> None:
+    """Writes every named DataFrame to its own tab in one .xlsx workbook,
+    in the given order. A sheet longer than Excel's own row limit
+    (EXCEL_MAX_ROWS) is spilled out to a companion CSV instead (with a
+    one-line note left in its place in the workbook), since Excel would
+    otherwise silently truncate it."""
+    with pd.ExcelWriter(path, engine="xlsxwriter") as xl:
+        for sheet, df in sheets.items():
+            if len(df) > EXCEL_MAX_ROWS:
+                csv_name = f"{os.path.splitext(path)[0]} {sheet}.csv"
+                df.to_csv(csv_name, index=False, encoding="utf-8-sig")
+                print(f"  {sheet}: {len(df):,} rows exceed Excel's row limit "
+                      f"-> {csv_name}")
+                pd.DataFrame({"note": [f"{sheet} exported to {csv_name} (too large for one sheet)"]}
+                             ).to_excel(xl, sheet_name=sheet, index=False)
+            else:
+                df.to_excel(xl, sheet_name=sheet, index=False)
+                print(f"  {sheet}: {len(df):,} row(s)")
 
 
-def _write_outputs(base_path: str, sheets: dict) -> list:
-    """Writes every named DataFrame to its own CSV file (CSV has no
-    multi-sheet concept, so each of the old workbook's sheets becomes a
-    separate file - see _sheet_csv_path()). utf-8-sig encoding (a UTF-8
-    BOM) so Excel - which this output is routinely opened in despite being
-    plain CSV - renders non-ASCII characters correctly instead of
-    mis-detecting the encoding. Returns the list of paths written, in the
-    same order as `sheets`."""
-    paths = []
-    for sheet, df in sheets.items():
-        path = _sheet_csv_path(base_path, sheet)
-        df.to_csv(path, index=False, encoding="utf-8-sig")
-        print(f"  {sheet}: {len(df):,} row(s) -> {path}")
-        paths.append(path)
-    return paths
+def _convert_to_xlsb(xlsx_path: str, xlsb_path: str) -> bool:
+    """Saves a copy of the already-written .xlsx workbook as .xlsb via
+    Excel COM automation (FileFormat 50 = xlsb) - the only reliable way to
+    WRITE .xlsb, since no Python library (pandas/openpyxl/xlsxwriter/
+    pyxlsb) can. Requires `pip install pywin32` and a local Excel install
+    (Windows only); returns False (leaving the .xlsx as the real output)
+    if either isn't available, rather than failing the whole run over an
+    optional secondary format."""
+    try:
+        import win32com.client as win32
+    except ImportError:
+        print("  Skipping .xlsb conversion - pywin32 isn't installed "
+              "(`pip install pywin32`). Kept the .xlsx output.")
+        return False
+
+    abs_xlsx, abs_xlsb = os.path.abspath(xlsx_path), os.path.abspath(xlsb_path)
+    excel = None
+    try:
+        excel = win32.gencache.EnsureDispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(abs_xlsx)
+        try:
+            wb.SaveAs(abs_xlsb, FileFormat=50)
+        finally:
+            wb.Close(SaveChanges=False)
+        return True
+    except Exception as exc:
+        print(f"  Skipping .xlsb conversion - Excel COM automation failed: "
+              f"{exc}. Kept the .xlsx output.")
+        return False
+    finally:
+        if excel is not None:
+            excel.Quit()
 
 
 if __name__ == "__main__":
