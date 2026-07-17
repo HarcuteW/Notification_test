@@ -21,28 +21,45 @@ pipeline is now built as three sequential phases instead of one flat set of
     UNMERGED list - rows here are not deduped against each other, so a
     manual reviewer sees every original row untouched.
 
-  PHASE 2 - Name+Suffix ID Cascade (Step 3 of the new spec)
+  PHASE 2 - Name ID Cascade (Step 3 of the new spec)
     Every remaining row (real First AND Last Name) is first partitioned by
-    an EXACT normalized (First Name, Last Name, Suffix) key - two rows can
-    ONLY ever end up in the same merged person if they share this exact
-    key. (This is a deliberate change from the old script's prefix/initial-
-    tolerant name matching - see the "Name grouping" note below.) WITHIN
-    each such name partition, rows are further clustered by 5 strict
-    priority levels, applied in order and LOCKED same as the old script's
-    LEVEL_ORDER mechanism (a level's groups, once formed, can gain new rows
-    from a later/weaker level but can never be bridged into another already-
-    locked group by a later level):
+    an EXACT normalized (First Name, Last Name) key - two rows can ONLY
+    ever end up in the same merged person if they share this exact key.
+    Suffix plays NO role in this decision (see the "Suffix" note below) -
+    a real match can be found between two rows even when their Suffix
+    differs or one has none. (This is a deliberate change from the old
+    script's prefix/initial-tolerant name matching - see the "Name
+    grouping" note below.) WITHIN each such name partition, rows are
+    further clustered by 5 strict priority levels, applied in order and
+    LOCKED same as the old script's LEVEL_ORDER mechanism (a level's
+    groups, once formed, can gain new rows from a later/weaker level but
+    can never be bridged into another already-locked group by a later
+    level):
         Level 1: SSN                    (Step 3.1)
         Level 2: SSN + DOB              (Step 3.2)
         Level 3: Driver's License       (Step 3.3)
         Level 4: Passport               (Step 3.4)
         Level 5: Tax Identification     (Step 3.5)
-    Since every pair compared already shares the exact same Name+Suffix,
-    Name itself is no longer part of any level's match test - each level
-    only checks the ID evidence itself, plus the same conflict guards as
-    before (a genuinely differing DOB blocks a same-SSN match; a genuinely
-    differing SSN blocks a same-DOB match; a genuinely differing Middle
-    Name blocks any level - blank/prefix-compatible Middle Name is fine).
+    Since every pair compared already shares the exact same First+Last
+    Name, Name itself is no longer part of any level's match test - each
+    level only checks the ID evidence itself, plus the same conflict
+    guards as before (a genuinely differing DOB blocks a same-SSN match; a
+    genuinely differing SSN blocks a same-DOB match; a genuinely differing
+    Middle Name blocks any level - blank/prefix-compatible Middle Name is
+    fine).
+
+    ASSUMPTION - "Suffix" (COL_SUFFIX) is excluded from matching entirely,
+    per explicit instruction - it is neither part of the partition key nor
+    a conflict guard. Two rows for the same First+Last Name merge freely
+    regardless of Suffix (e.g. a row with no Suffix and a row with "Jr"
+    can merge on a shared SSN; two rows with genuinely different Suffixes,
+    e.g. "Jr" vs "Sr", CAN also merge if their ID evidence matches - this
+    is a real risk for father/son-style records that only differ by
+    Suffix, since nothing here can tell them apart anymore). Suffix
+    remains a plain OUTPUT field (see COL_SUFFIX handling in main()'s Step
+    4 build loop) - the fullest value seen is still displayed - it just
+    never influences WHICH rows get merged.
+
     Employee ID, Phone Number, Email Address, and every address field are
     NO LONGER matching criteria in this version (the old script's Rules 4,
     7, 8, 9 are gone) - they are purely APPENDED attributes now (Step 4):
@@ -73,14 +90,14 @@ pipeline is now built as three sequential phases instead of one flat set of
         never semicolon-merged (see main()'s Step 4 build loop and
         _fold_row_into(), which both deliberately exclude it).
 
-    ASSUMPTION - Name grouping is an EXACT normalized match (no prefix/
-    initial tolerance), taken from the literal "First + Last Name + Suffix
-    combination" wording in the spec. If two rows for the same person use
-    an initial vs. a full name ("J" vs "Jeffrey"), they will NOT be grouped
-    together in this version, unlike the old script's name_prefix_compat().
+    ASSUMPTION - Name grouping is an EXACT normalized First+Last Name
+    match (no prefix/initial tolerance). If two rows for the same person
+    use an initial vs. a full name ("J" vs "Jeffrey"), they will NOT be
+    grouped together in this version, unlike the old script's
+    name_prefix_compat().
 
   PHASE 3 - Blank-ID Fold (Step 5 of the new spec)
-    Once Phase 2 is done, each Name+Suffix partition may still hold 2+
+    Once Phase 2 is done, each First+Last Name partition may still hold 2+
     separate output rows (only when nothing bridged them at any of the 5
     levels). These are split into:
       - FILLED rows: at least one of SSN/DOB/Driver's License/Passport/Tax
@@ -89,7 +106,7 @@ pipeline is now built as three sequential phases instead of one flat set of
         name, and maybe Address/Employee ID/Phone/Email/DOCID).
     Every BLANK-ID row in a partition is folded together into ONE combined
     row FIRST, regardless of how many FILLED rows exist or whether they'll
-    turn out to tie - two blank-ID rows sharing a Name+Suffix have, by
+    turn out to tie - two blank-ID rows sharing a First+Last Name have, by
     definition, no ID evidence that could conflict, so there's no reason to
     leave several as separate stragglers just because it's unclear which
     FILLED row (if any) they ultimately belong with. That single combined
@@ -106,8 +123,8 @@ pipeline is now built as three sequential phases instead of one flat set of
         on both, the combined blank row is left standing alone and reported
         on the "Ambiguous Name-Group Review" sheet instead of guessed at;
       - nothing further, if the partition has NO filled row at all - the
-        combined blank row IS the final row, Name+Suffix alone being the
-        only evidence there is.
+        combined blank row IS the final row, First+Last Name alone being
+        the only evidence there is.
     ASSUMPTION: the tie-break logic and its review sheet reuse the same
     "richest profile wins, true ties get reported" approach the prior
     Unknown Name Bridge pass used (see hc_script_unknowns.py), extended
@@ -162,8 +179,8 @@ OUTPUT : SIX separate CSV files (CSV has no concept of multiple sheets in
            dropped).
          - "Large Group Review": every merged group with more than 50 rows.
          - "Ambiguous Name-Group Review": every blank-ID row (already
-           combined with any sibling blank-ID rows sharing its Name+Suffix
-           - see Phase 3) that had 2+ filled-row candidates, still tied
+           combined with any sibling blank-ID rows sharing its First+Last
+           Name - see Phase 3) that had 2+ filled-row candidates, still tied
            after both the evidence-richness AND majority-size tie-breaks -
            left unmerged (standing alone in Merged Notification Data)
            rather than guessed at.
@@ -173,7 +190,7 @@ secured/authorized folder for this data (never a desktop) - it contains
 SSN, DOB, and other PII/PHI.
 
 Designed for large row counts (uses "blocking" - only compares rows that
-already share an exact Name+Suffix key AND an exact SSN, DOB, Driver's
+already share an exact First+Last Name key AND an exact SSN, DOB, Driver's
 License, Passport, or Tax ID - instead of comparing every row to every
 other row).
 
@@ -447,12 +464,12 @@ def norm_name(v) -> str:
 
     PERFORMANCE: interns the result (sys.intern) when non-blank. First/Last/
     Middle/Suffix values repeat heavily in real person data (thousands of
-    "SMITH"s, "JOHN"s, ...) - this is the string used to build every
-    Name+Suffix bucket key (see bucket_candidate_pairs()), so making equal
-    names share one string object lets tuple hashing/equality short-circuit
-    on identity instead of a full character comparison every time. Interning
-    a string never changes its value or equality behavior - purely a
-    memory/speed optimization."""
+    "SMITH"s, "JOHN"s, ...) - First/Last specifically are the strings used
+    to build every Name bucket key (see bucket_candidate_pairs()), so
+    making equal names share one string object lets tuple hashing/equality
+    short-circuit on identity instead of a full character comparison every
+    time. Interning a string never changes its value or equality behavior
+    - purely a memory/speed optimization."""
     s = norm_text(v)
     core = re.sub(r"[^A-Z0-9]", "", s)
     if not core or core in NAME_PLACEHOLDERS:
@@ -736,8 +753,9 @@ def build_records(df: pd.DataFrame):
 # 4) Phase 2 pairwise matching rules - each pair tested here already shares
 #    the EXACT same (First Name, Last Name, Suffix) key (see
 #    bucket_candidate_pairs()), so unlike the old script, none of these
-#    functions need to check Name/Suffix themselves - only the ID evidence
-#    itself, plus the same conflict guards as before.
+#    functions need to check Name themselves - only the ID evidence itself,
+#    plus the same conflict guards as before. Suffix is checked NOWHERE in
+#    this cascade - see the module docstring's "Suffix" ASSUMPTION note.
 # ------------------------------------------------------------
 def dob_conflict(r1: Rec, r2: Rec) -> bool:
     """True when BOTH rows have a usable DOB and it genuinely disagrees."""
@@ -760,10 +778,11 @@ def name_prefix_compat(a: str, b: str) -> bool:
 
 def mid_conflict(r1: Rec, r2: Rec) -> bool:
     """True when Middle Name is present (non-blank, non-prefix-compatible)
-    on both sides and genuinely disagrees. First/Last/Suffix are already
-    guaranteed equal by the Name+Suffix partition these two rows came from
-    (see bucket_candidate_pairs()), so only Middle Name still needs an
-    active-conflict guard here."""
+    on both sides and genuinely disagrees. First/Last are already
+    guaranteed equal by the Name partition these two rows came from (see
+    bucket_candidate_pairs()), so only Middle Name still needs an active-
+    conflict guard here - Suffix is deliberately NOT checked at all (see
+    the module docstring's "Suffix" ASSUMPTION note)."""
     return not name_prefix_compat(r1.mid, r2.mid)
 
 
@@ -783,9 +802,9 @@ def ssn_match(r1: Rec, r2: Rec) -> bool:
 
 
 def ssn_dob_match(r1: Rec, r2: Rec) -> bool:
-    """Step 3.2 - SSN + DOB: same DOB (Name+Suffix already guaranteed equal
-    by the partition), as long as SSN doesn't conflict (blank on either/both
-    sides is fine) and Middle Name doesn't actively disagree."""
+    """Step 3.2 - SSN + DOB: same DOB (First+Last Name already guaranteed
+    equal by the partition), as long as SSN doesn't conflict (blank on
+    either/both sides is fine) and Middle Name doesn't actively disagree."""
     if ssn_conflict(r1, r2):
         return False
     if mid_conflict(r1, r2):
@@ -927,29 +946,32 @@ class UnionFind:
 
 # ------------------------------------------------------------
 # 6) Blocking - every bucket key is prefixed with the row's exact
-#    (First Name, Last Name, Suffix) key, so two rows can NEVER be bucketed
-#    together (and therefore never unioned) unless they already share that
-#    exact Name+Suffix - this is what makes Phase 2's per-name partitioning
-#    a hard boundary rather than something enforced by a separate loop.
+#    (First Name, Last Name) key - deliberately NOT Suffix (see the module
+#    docstring's "Suffix" ASSUMPTION note) - so two rows can NEVER be
+#    bucketed together (and therefore never unioned) unless they already
+#    share that exact First+Last Name - this is what makes Phase 2's
+#    per-name partitioning a hard boundary rather than something enforced
+#    by a separate loop.
 # ------------------------------------------------------------
 def describe_bucket_key(key) -> str:
     """PII-safe label for a bucket's grouping field - NEVER the actual
     Name/ID value (bucket keys are built directly from real PII/PHI - see
     bucket_candidate_pairs())."""
     level = key[0]
-    return f"{LEVEL_NAMES[level]} (within same Name+Suffix)"
+    return f"{LEVEL_NAMES[level]} (within same First+Last Name)"
 
 
 def bucket_candidate_pairs(recs, known_idxs):
     """Returns (level_pairs, biggest_buckets) - same shape/purpose as
     hc_script_old.py's version, but only over known_idxs (rows with a real
     First AND Last Name - see Phase 1), and every bucket key includes the
-    row's exact (first, last, suffix) tuple so a candidate pair can only
-    ever be produced between two rows sharing that exact Name+Suffix."""
+    row's exact (first, last) tuple - Suffix is deliberately excluded (see
+    module docstring) - so a candidate pair can only ever be produced
+    between two rows sharing that exact First+Last Name."""
     buckets = defaultdict(list)
     for i in known_idxs:
         r = recs[i]
-        name_key = (r.first, r.last, r.suffix)
+        name_key = (r.first, r.last)
         if r.ssn:
             buckets[(LEVEL_SSN, name_key, r.ssn)].append(i)
         if r.dob:
@@ -1283,8 +1305,11 @@ def _fold_row_into(base: dict, extra: dict) -> None:
     'Other Address', are all just semicolon_merge()'d as plain text (both
     sides already hold '; '-joined values from Phase 2's build, and neither
     side was confirmed to share a physical address with the other beyond
-    the same Name+Suffix - appending rather than re-running the majority-
-    address clustering is the safer choice for this cross-group fold)."""
+    the same First+Last Name - appending rather than re-running the
+    majority-address clustering is the safer choice for this cross-group
+    fold). COL_SUFFIX is merged the same way as First/Middle/Last (fullest
+    real value wins) even though it's never used to decide the fold - see
+    the module docstring's "Suffix" ASSUMPTION note."""
     for col in [COL_DOCID] + OTHER_MERGE_COLS + ADDRESS_COLS + ["Other Address"]:
         base[col] = semicolon_merge([base.get(col, ""), extra.get(col, "")])
     base[COL_DOB] = dob_merge([base.get(COL_DOB, ""), extra.get(COL_DOB, "")])
@@ -1304,21 +1329,23 @@ def _fold_row_into(base: dict, extra: dict) -> None:
 
 def fold_blank_id_rows(known_rows: list) -> tuple:
     """Step 5 - POST-BUILD pass over Phase 2's built rows. Groups them by
-    the exact (First Name, Last Name, Suffix) key (re-derived via
-    norm_name() - every row in one Phase-2 group already shares this exact
-    key, so recomputing it here reconstructs the same partition), then
-    within any partition holding 2+ rows:
+    the exact (First Name, Last Name) key (re-derived via norm_name() -
+    every row in one Phase-2 group already shares this exact key, so
+    recomputing it here reconstructs the same partition - Suffix is
+    deliberately excluded, same as Phase 2's own partition key; see the
+    module docstring's "Suffix" ASSUMPTION note), then within any
+    partition holding 2+ rows:
       - Every BLANK-ID row (none of the 5 ID fields populated) is folded
         together into ONE combined blank row FIRST, regardless of how many
         FILLED candidates exist or whether they'll turn out to tie - two
-        blank-ID rows sharing a Name+Suffix have, by definition, no ID
+        blank-ID rows sharing a First+Last Name have, by definition, no ID
         evidence that could conflict between them, so there's no reason to
         ever leave them as separate stragglers (this also means an
         unresolved/ambiguous case below still reports ONE reviewable row,
         not N).
       - no FILLED row anywhere in the partition: that combined blank row
-        IS the final row - Name+Suffix alone is the only evidence there
-        is, nothing is left unmerged.
+        IS the final row - First+Last Name alone is the only evidence
+        there is, nothing is left unmerged.
       - exactly one FILLED row: fold the combined blank row into it.
       - 2+ FILLED rows: break the tie in two stages - first by evidence
         richness (_row_evidence_score(), 0-5 ID fields populated), then,
@@ -1336,7 +1363,7 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
     Returns (final_rows, review_rows)."""
     groups = defaultdict(list)
     for i, row in enumerate(known_rows):
-        key = (norm_name(row[COL_FIRST]), norm_name(row[COL_LAST]), norm_name(row.get(COL_SUFFIX, "")))
+        key = (norm_name(row[COL_FIRST]), norm_name(row[COL_LAST]))
         groups[key].append(i)
 
     absorbed = set()
@@ -1358,7 +1385,7 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
             absorbed.add(i)
 
         if not filled:
-            # No ID evidence anywhere in this Name+Suffix partition -
+            # No ID evidence anywhere in this First+Last Name partition -
             # nothing further to do, the combined blank row stands as-is.
             continue
 
@@ -1390,12 +1417,14 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
             review_rows.append({
                 "First Name": known_rows[blank_base][COL_FIRST],
                 "Last Name": known_rows[blank_base][COL_LAST],
+                # Suffix is informational only here - it plays no role in
+                # the grouping/tie-break decision (see module docstring).
                 "Suffix": known_rows[blank_base].get(COL_SUFFIX, ""),
                 "DOCIDs": known_rows[blank_base].get(COL_DOCID, ""),
                 "Remarks": (f"{len(winners)} equally-strong filled candidates share this "
-                            f"Name+Suffix, tied on evidence ({best_ev} of 5 ID fields each) "
-                            f"and on merged-row count ({size_scores[winners[0]]} rows each) - "
-                            f"left unmerged, needs manual review"),
+                            f"First+Last Name, tied on evidence ({best_ev} of 5 ID fields "
+                            f"each) and on merged-row count ({size_scores[winners[0]]} rows "
+                            f"each) - left unmerged, needs manual review"),
             })
 
     final_rows = [row for i, row in enumerate(known_rows) if i not in absorbed]
@@ -1498,9 +1527,9 @@ def main() -> None:
           f"{len(known_idxs):,} row(s) proceed to matching.")
     unknown_rows = build_unknown_entries(df, recs, unknown_idxs)
 
-    # ---- Phase 2: Name+Suffix ID Cascade (Step 3) ----
+    # ---- Phase 2: Name ID Cascade (Step 3) ----
     print("Clustering (blocked comparison, strict priority levels, scoped "
-          "within exact Name+Suffix) ...")
+          "within exact First+Last Name) ...")
     t0 = time.monotonic()
     level_pairs, biggest_buckets = bucket_candidate_pairs(recs, known_idxs)
     total_candidates = sum(len(p) for p in level_pairs.values())
@@ -1702,8 +1731,8 @@ def main() -> None:
     print(f"  Output built. ({time.monotonic() - t0:.1f}s)")
 
     # ---- Phase 3: Blank-ID Fold (Step 5) ----
-    print("Folding blank-ID rows into their Name+Suffix's filled row(s) "
-          "(Step 5) ...")
+    print("Folding blank-ID rows into their First+Last Name's filled "
+          "row(s) (Step 5) ...")
     t0 = time.monotonic()
     known_rows, ambiguous_review = fold_blank_id_rows(known_rows)
     print(f"  {len(known_rows):,} row(s) remain after Phase 3. "
@@ -1711,7 +1740,8 @@ def main() -> None:
     if ambiguous_review:
         print(f"  {len(ambiguous_review):,} blank-ID row(s) left unmerged - "
               f"tied on evidence between 2+ filled candidates sharing the "
-              f"same Name+Suffix. See the 'Ambiguous Name-Group Review' sheet.")
+              f"same First+Last Name. See the 'Ambiguous Name-Group Review' "
+              f"sheet.")
 
     # ---- DOCID overflow split - runs once, on the FINAL row set, so a
     #      DOCID list gained via Phase 3 folding is chunked correctly. ----
@@ -1775,13 +1805,14 @@ def main() -> None:
     })
     print(f"  Written. ({time.monotonic() - t0:.1f}s)")
 
-    print(f"Done -> {len(written_paths)} file(s) written "
-          f"(total runtime {_format_duration(time.monotonic() - run_start)}):")
+    print(f"Done -> {len(written_paths)} file(s) written:")
     for p in written_paths:
         print(f"  {p}")
     print("Reminder: save the output only to the secured/authorized folder for "
           "this data - never a desktop or personal drive. It contains SSN, "
           "DOB, and other PII/PHI.")
+    print(f"Total run time: {_format_duration(time.monotonic() - run_start)} "
+          f"(start to end).")
 
 
 def _sheet_csv_path(base_path: str, sheet: str) -> str:
