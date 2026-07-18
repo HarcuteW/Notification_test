@@ -23,10 +23,14 @@ pipeline is now built as three sequential phases instead of one flat set of
 
   PHASE 2 - Name ID Cascade (Step 3 of the new spec)
     Every remaining row (real First AND Last Name) is first partitioned by
-    an EXACT normalized (First Name, Middle Name, Last Name, Suffix) key -
-    two rows can ONLY ever end up in the same merged person if they share
-    this exact 4-field key. (This is a deliberate change from the old
-    script's prefix/initial-tolerant name matching - see the "Name
+    an EXACT normalized (First Name, Last Name) key - two rows can ONLY
+    ever end up in the same merged person if they share this exact
+    2-field key. Middle Name and Suffix are NOT part of it (see "Middle
+    Name / Suffix combining" below) and never block a match either -
+    unlike the old script's Middle Name conflict guard, a differing (or
+    one-sided blank) Middle Name/Suffix can never keep two rows apart
+    anymore. (The exact-match-no-prefix-tolerance behavior for First/Last
+    themselves is unchanged from the prior version - see the "Name
     grouping" note below.) WITHIN each such name partition, rows are
     further clustered by 6 strict priority levels, applied in order and
     LOCKED same as the old script's LEVEL_ORDER mechanism (a level's
@@ -39,29 +43,21 @@ pipeline is now built as three sequential phases instead of one flat set of
         Level 4: Passport                     (Step 3.4)
         Level 5: Tax Identification           (Step 3.5)
         Level 6: Government-Issued ID Number  (Step 3.6)
-    Since every pair compared already shares the exact same First+Middle+
-    Last Name and Suffix, none of those four fields are part of any
-    level's match test anymore - each level only checks the ID evidence
-    itself, plus the same conflict guards as before (a genuinely differing
-    DOB blocks a same-SSN match; a genuinely differing SSN blocks a
-    same-DOB match). There is no separate Middle Name/Suffix conflict
-    guard needed (unlike the prior version of this script) - both are now
-    baked directly into the partition key, so equality is already
-    guaranteed for any pair reaching a level's match function.
+    Since every pair compared already shares the exact same First+Last
+    Name, that's no longer part of any level's match test - each level
+    only checks the ID evidence itself, plus the same conflict guards as
+    before (a genuinely differing DOB blocks a same-SSN match; a
+    genuinely differing SSN blocks a same-DOB match).
 
-    ASSUMPTION - per explicit instruction, Middle Name and Suffix are now
-    EXACT-match partition fields, same as First/Last - NOT blank-tolerant
-    the way Middle Name's old conflict guard was (blank used to match
-    anything; now a blank Middle Name and a real one are different keys
-    entirely, so they won't even be compared). This is a real risk: two
-    rows for the SAME person where only one has Middle Name/Suffix filled
-    in will NOT be grouped in Phase 2 at all - they can only reunite later
-    via Phase 3's blank-ID fold, and only if one of them ends up with no
-    other ID evidence either. Conversely, this also means two DIFFERENT
-    people who happen to share an exact First+Middle+Last+Suffix will no
-    longer be told apart by a differing Suffix (e.g. "Jr" vs "Sr") the way
-    Suffix alone briefly could before - see the ASSUMPTION note this
-    replaces in the prior version's history.
+    ASSUMPTION - per explicit instruction, Middle Name and Suffix no
+    longer influence matching AT ALL - not the partition key, not a
+    conflict guard. Two rows for the same First+Last Name merge freely
+    regardless of Middle Name/Suffix (a blank Middle Name and a filled
+    one, or "Jr" vs "Sr", can both merge on a shared SSN). This is a real
+    risk: two DIFFERENT people who happen to share an exact First+Last
+    Name and some ID evidence will no longer be told apart by a
+    genuinely differing Suffix or Middle Name the way either briefly
+    could in an earlier version of this script.
 
     Employee ID, Phone Number, Email Address, and every address field are
     NO LONGER matching criteria in this version (the old script's Rules 4,
@@ -86,7 +82,12 @@ pipeline is now built as three sequential phases instead of one flat set of
         independent field. Its value is used for matching (Steps 3.1/3.2)
         whenever COL_DOB itself is blank, and its raw value is folded into
         the same dob_merge() call that builds the output DOB display - it
-        never appears as its own output column.
+        never appears as its own output column. Per explicit instruction,
+        a genuinely different real DOB is NEVER allowed to end up in the
+        same merged person as a shared SSN - dob_conflict() blocks Step
+        3.1 outright, and every other ID level (3.2-3.6) requires DOB to
+        be matching-or-blank (compatible()) - a row with a conflicting
+        real DOB always stays its own separate line item.
       - COL_UNIQUE_ID ("Unique_ID") - the source database's own primary
         key for a row, confirmed NOT to be a person-identity signal (never
         used for matching). The output simply keeps whichever value was on
@@ -95,47 +96,78 @@ pipeline is now built as three sequential phases instead of one flat set of
         never semicolon-merged (see main()'s Step 4 build loop and
         _fold_row_into(), which both deliberately exclude it).
 
-    ASSUMPTION - Name grouping is an EXACT normalized First+Middle+Last+
-    Suffix match (no prefix/initial tolerance). If two rows for the same
-    person use an initial vs. a full name ("J" vs "Jeffrey"), they will
-    NOT be grouped together in this version, unlike the old script's
+    Middle Name / Suffix combining (Step 3.2 of the updated spec) - since
+    neither is part of the partition key anymore, a merged group can
+    genuinely contain different Middle Name/Suffix values, so each is
+    resolved differently once a group is built (see main()'s Step 4 and
+    _fold_row_into()):
+      - Middle Name: the fullest/most complete value seen (same
+        fullest_value() logic as First/Last/SSN) - "Max" meaning longest,
+        not statistically most frequent.
+      - Suffix: the MOST FREQUENT value seen (by normalized comparison),
+        ties broken by (1) the fullest raw representation of the tied
+        value, then (2) which tied value was seen first - see
+        _suffix_tally_from_raw()/_render_suffix_from_tally(). Frequency is
+        tracked via a small internal tally carried on every row (never an
+        output column) so it stays correct across every later merge stage
+        (Step 4's build AND Step 5's non-PII consolidation below), not
+        just within one stage.
+
+    ASSUMPTION - Name grouping is an EXACT normalized First+Last Name
+    match (no prefix/initial tolerance). If two rows for the same person
+    use an initial vs. a full name ("J" vs "Jeffrey"), they will NOT be
+    grouped together in this version, unlike the old script's
     name_prefix_compat().
 
-  PHASE 3 - Blank-ID Fold (Step 5 of the new spec)
-    Once Phase 2 is done, each First+Middle+Last+Suffix partition may
-    still hold 2+ separate output rows (only when nothing bridged them at
-    any of the 6 levels). These are split into:
+  PHASE 3 - Non-PII Consolidation (Step 5 of the updated spec)
+    Once Phase 2 is done, each First+Last Name partition may still hold
+    2+ separate output rows (only when nothing bridged them at any of
+    the 6 levels). These are split into:
       - FILLED rows: at least one of SSN/DOB/Driver's License/Passport/
         Tax ID/Government-Issued ID Number is populated.
-      - BLANK-ID rows: none of those six fields are populated (only a
-        name, and maybe Address/Employee ID/Phone/Email/DOCID).
+      - BLANK-ID rows: none of those six PII fields are populated (only a
+        name, and maybe non-PII attributes - Address/Employee ID/Phone/
+        Email/DOCID/other OTHER_MERGE_COLS fields).
     Every BLANK-ID row in a partition is folded together into ONE combined
-    row FIRST, regardless of how many FILLED rows exist or whether they'll
-    turn out to tie - two blank-ID rows sharing a First+Middle+Last+Suffix
-    have, by definition, no ID evidence that could conflict, so there's no
-    reason to leave several as separate stragglers just because it's
-    unclear which FILLED row (if any) they ultimately belong with. That
-    single combined row is then folded (its Address/Employee ID/Phone/
-    Email/DOCID appended in) into:
+    row FIRST, regardless of how many FILLED rows exist or how they'll
+    eventually be resolved - two blank-ID rows sharing a First+Last Name
+    have, by definition, no PII evidence that could conflict, so there's
+    no reason to leave several as separate stragglers. That single
+    combined row is then folded (its Address/Employee ID/Phone/Email/
+    DOCID/etc. appended in) into:
       - the partition's one FILLED row, if there is exactly one;
-      - the best of 2+ FILLED rows, decided in two stages - first by
-        richness (most of the 6 ID fields populated), then, if that ties,
-        by which FILLED row represents the MAJORITY of original rows
-        ("Rows Merged") - a cluster of many corroborating rows sharing one
-        ID field outweighs a same-richness single straggler. A single
-        winner after both stages is unambiguous - flagged True in the
-        "Blank-ID Row Merged (Tie-Break)" output column; if it's STILL tied
-        on both, the combined blank row is left standing alone and reported
-        on the "Ambiguous Name-Group Review" sheet instead of guessed at;
+      - with 2+ FILLED rows, FIRST a filled candidate that shares a REAL
+        non-PII attribute with the combined blank row - the EXACT same
+        full Address, or an overlapping value in ANY OTHER_MERGE_COLS
+        field (Email, Phone, Employee ID, Contact Information,
+        Work-Related Information, Data Subject Type, ... - see
+        _shares_nonpii_attribute()). If that resolves to EXACTLY one
+        candidate, fold there directly - a real shared attribute, not a
+        guess, so NOT flagged in "Blank-ID Row Merged (Tie-Break)".
+      - only if that's inconclusive (no candidate shares anything, or 2+
+        conflictingly do) does it fall back to "the top combined entry":
+        the richest FILLED row by ID evidence (most of the 6 fields
+        populated), then, if THAT ties too, the one representing the
+        MAJORITY of original rows ("Rows Merged") - flagged True in
+        "Blank-ID Row Merged (Tie-Break)" this time, since it WAS a
+        guess. Only if even this fallback is fully tied (same evidence
+        AND same size) is the combined blank row left standing alone and
+        reported on the "Ambiguous Name-Group Review" sheet instead of
+        guessed at - now a much rarer outcome than before, since the
+        evidence/size fallback almost always produces a single winner;
       - nothing further, if the partition has NO filled row at all - the
-        combined blank row IS the final row, First+Middle+Last+Suffix
-        alone being the only evidence there is.
-    ASSUMPTION: the tie-break logic and its review sheet reuse the same
-    "richest profile wins, true ties get reported" approach the prior
-    Unknown Name Bridge pass used (see hc_script_unknowns.py), extended
-    with the majority-size second stage - Address/Employee ID/Phone/Email
-    are NEVER used to decide a fold, only appended after the decision is
-    made, consistent with Step 4's append-only role for those fields.
+        combined blank row IS the final row, First+Last Name alone being
+        the only evidence there is.
+    ASSUMPTION - per explicit instruction, the non-PII attribute sweep
+    checks EVERY OTHER_MERGE_COLS field, not just Address/Email/Phone -
+    the broadest reading of "Tags, etc.". This carries a real risk: a
+    coincidental shared value in a generic, low-information field (e.g.
+    the same "Data Subject Type") could link two unrelated people who
+    happen to share a name - accepted per explicit instruction, but worth
+    knowing about. The Address match specifically is an EXACT normalized
+    match only (no blank-tolerant/unit-suffix fuzziness, unlike the
+    majority-address clustering in split_addresses()) - per explicit
+    instruction.
 
 INPUT  : a CSV file (INPUT_CSV below) with the columns listed in
          EXPECTED_COLS below - every column read and written as plain text
@@ -150,8 +182,11 @@ OUTPUT : ONE workbook (OUTPUT_XLSB below), with the six sheets below each
          reported as the real output instead - see main().
          - "Merged Notification Data": ONE ROW PER CONFIRMED PERSON
            (known-name rows only - see Unknown_Entries below).
-           - First Name, Middle Name, Last Name, Suffix, and SSN: the
-             single fullest/most complete value among the merged rows.
+           - First Name, Middle Name, Last Name, and SSN: the single
+             fullest/most complete value among the merged rows.
+           - Suffix: the single MOST FREQUENT value among the merged rows
+             (not fullest - see the Phase 2 "Middle Name / Suffix
+             combining" note and _render_suffix_from_tally()).
            - DOB: every distinct real date seen, "; "-joined, formatted
              MM/DD/YYYY (see dob_merge()).
            - Driver's License, Passport Number, Tax Identification Number,
@@ -173,9 +208,12 @@ OUTPUT : ONE workbook (OUTPUT_XLSB below), with the six sheets below each
            - "Names Differ": True if 2+ raw (pre-normalization) First or
              Last Name spellings were seen in the group.
            - "Blank-ID Row Merged (Tie-Break)": True only for a row that
-             absorbed a blank-ID row via an evidence tie-break among 2+
-             equally-matched filled candidates (see Phase 3) - worth a
-             quick double-check.
+             absorbed a blank-ID row via the evidence/size FALLBACK (see
+             Phase 3) - i.e. no shared non-PII attribute resolved it, so
+             it was decided by which filled candidate was richest/biggest
+             instead. Worth a quick double-check. Never True for a row
+             absorbed via a real shared non-PII attribute (Address/Email/
+             Phone/etc. match) - that's not a guess.
          - "Unknown_Entries": every raw row pulled out in Phase 1 (First
            and/or Last Name blank/placeholder) - unmerged, one row each,
            with the blank name side(s) displayed as "[Unknown]".
@@ -186,20 +224,23 @@ OUTPUT : ONE workbook (OUTPUT_XLSB below), with the six sheets below each
            dropped).
          - "Large Group Review": every merged group with more than 50 rows.
          - "Ambiguous Name-Group Review": every blank-ID row (already
-           combined with any sibling blank-ID rows sharing its First+
-           Middle+Last+Suffix Name - see Phase 3) that had 2+ filled-row
-           candidates, still tied after both the evidence-richness AND
-           majority-size tie-breaks - left unmerged (standing alone in
-           Merged Notification Data) rather than guessed at.
+           combined with any sibling blank-ID rows sharing its First+Last
+           Name - see Phase 3) that had 2+ filled-row candidates sharing
+           no distinguishing non-PII attribute, still tied after both the
+           evidence-richness AND majority-size fallback tie-breaks - left
+           unmerged (standing alone in Merged Notification Data) rather
+           than guessed at. Expected to be rare/usually empty now, since
+           the non-PII match and the evidence/size fallback together
+           resolve almost every case.
 
 This script does not touch the input file. Save the output only to the
 secured/authorized folder for this data (never a desktop) - it contains
 SSN, DOB, and other PII/PHI.
 
 Designed for large row counts (uses "blocking" - only compares rows that
-already share an exact First+Middle+Last+Suffix Name key AND an exact SSN,
-DOB, Driver's License, Passport, or Tax ID - instead of comparing every row
-to every other row).
+already share an exact First+Last Name key AND an exact SSN, DOB, Driver's
+License, Passport, Tax ID, or Government-Issued ID Number - instead of
+comparing every row to every other row).
 
 Install once:
     pip install pandas numpy xlsxwriter
@@ -821,18 +862,32 @@ def compatible(a: str, b: str) -> bool:
     return not a or not b or a == b
 
 
+def ssn_full(r: Rec) -> bool:
+    """True only when r.ssn is a COMPLETE, unmasked 9-digit SSN (no 'X'
+    placeholder characters) - see norm_ssn()/SSN_MIN_KNOWN_OVERLAP. A
+    masked/partial SSN (e.g. 'XXX-XX-1234') is real evidence for the SSN
+    conflict guard (ssn_conflict()) and for the SSN+DOB/DL/Passport/TaxID/
+    GovID compatibility checks, but per explicit instruction it must NEVER
+    by itself be enough to CONFIRM a Level-1 SSN match - two different
+    people who happen to share the same last few known digits (a real risk
+    at scale, especially common names) must not be merged on that alone."""
+    return bool(r.ssn) and "X" not in r.ssn
+
+
 def ssn_match(r1: Rec, r2: Rec) -> bool:
-    """Step 3.1 - SSN: both rows have the same usable SSN, unless a
-    genuinely differing DOB blocks it."""
+    """Step 3.1 - SSN: both rows have the same FULL (unmasked) SSN, unless
+    a genuinely differing DOB blocks it. See ssn_full() - a masked/partial
+    SSN is never sufficient for this level, even if both sides match
+    exactly."""
     if dob_conflict(r1, r2):
         return False
-    return bool(r1.ssn) and bool(r2.ssn) and r1.ssn == r2.ssn
+    return ssn_full(r1) and ssn_full(r2) and r1.ssn == r2.ssn
 
 
 def ssn_dob_match(r1: Rec, r2: Rec) -> bool:
-    """Step 3.2 - SSN + DOB: same DOB (First+Middle+Last+Suffix already
-    guaranteed equal by the partition), as long as SSN doesn't conflict
-    (blank on either/both sides is fine)."""
+    """Step 3.2 - SSN + DOB: same DOB (First+Last Name already guaranteed
+    equal by the partition), as long as SSN doesn't conflict (blank on
+    either/both sides is fine)."""
     if ssn_conflict(r1, r2):
         return False
     return bool(r1.dob) and r1.dob == r2.dob
@@ -981,32 +1036,34 @@ class UnionFind:
 
 # ------------------------------------------------------------
 # 6) Blocking - every bucket key is prefixed with the row's exact
-#    (First Name, Middle Name, Last Name, Suffix) key, so two rows can
-#    NEVER be bucketed together (and therefore never unioned) unless they
-#    already share that exact 4-field Name - this is what makes Phase 2's
-#    per-name partitioning a hard boundary rather than something enforced
-#    by a separate loop.
+#    (First Name, Last Name) key, so two rows can NEVER be bucketed
+#    together (and therefore never unioned) unless they already share
+#    that exact First+Last Name - this is what makes Phase 2's per-name
+#    partitioning a hard boundary rather than something enforced by a
+#    separate loop. Middle Name and Suffix are NOT part of this key (see
+#    the module docstring) - they're combined as display attributes for
+#    whatever cluster forms (Middle Name: fullest value; Suffix: most
+#    frequent value), never used to decide who merges with whom.
 # ------------------------------------------------------------
 def describe_bucket_key(key) -> str:
     """PII-safe label for a bucket's grouping field - NEVER the actual
     Name/ID value (bucket keys are built directly from real PII/PHI - see
     bucket_candidate_pairs())."""
     level = key[0]
-    return f"{LEVEL_NAMES[level]} (within same First+Middle+Last+Suffix)"
+    return f"{LEVEL_NAMES[level]} (within same First+Last Name)"
 
 
 def bucket_candidate_pairs(recs, known_idxs):
     """Returns (level_pairs, biggest_buckets) - same shape/purpose as
     hc_script_old.py's version, but only over known_idxs (rows with a real
     First AND Last Name - see Phase 1), and every bucket key includes the
-    row's exact (first, mid, last, suffix) tuple so a candidate pair can
-    only ever be produced between two rows sharing that exact 4-field
-    Name."""
+    row's exact (first, last) tuple so a candidate pair can only ever be
+    produced between two rows sharing that exact First+Last Name."""
     buckets = defaultdict(list)
     for i in known_idxs:
         r = recs[i]
-        name_key = (r.first, r.mid, r.last, r.suffix)
-        if r.ssn:
+        name_key = (r.first, r.last)
+        if ssn_full(r):
             buckets[(LEVEL_SSN, name_key, r.ssn)].append(i)
         if r.dob:
             buckets[(LEVEL_SSNDOB, name_key, r.dob)].append(i)
@@ -1204,6 +1261,73 @@ def fullest_value(raw_values, norm_values) -> str:
 def has_variation(raw_values) -> bool:
     """True if 2+ distinct real raw values were seen for this field."""
     return len({norm_text(v) for v in raw_values if norm_text(v)}) > 1
+
+
+# ------------------------------------------------------------
+# 7a2) Suffix - "most frequent value" (Step 3.2 of the updated spec).
+# Unlike First/Last/Middle/SSN (fullest_value() - one pass, no history
+# needed), the WINNING Suffix can change as more rows fold in over
+# multiple merge stages (Step 4's ID-cascade build, then Step 5's non-PII
+# consolidation) - "Jr" might lead 3-to-2 after Step 4, then a fold in
+# Step 5 could tip it to "Sr" 3-to-4. So every row carries a small tally
+# (normalized Suffix -> [count, fullest raw seen]) as internal bookkeeping
+# alongside its displayed COL_SUFFIX value, updated at every merge/fold
+# and never included in the output (see _merged_output_column_order() -
+# only explicitly-listed columns make it into the final CSV/workbook).
+# ------------------------------------------------------------
+_SUFFIX_TALLY_KEY = "_suffix_tally"
+
+
+def _suffix_tally_from_raw(raw_values) -> dict:
+    """Builds a fresh {normalized_suffix: [count, fullest_raw]} tally from
+    a list of raw Suffix cell values - blank/placeholder values (see
+    norm_name()) contribute nothing. Dict insertion order doubles as the
+    'first seen' tie-break in _render_suffix_from_tally()."""
+    tally = {}
+    for raw in raw_values:
+        norm = norm_name(raw)
+        if not norm:
+            continue
+        raw_str = "" if raw is None else str(raw).strip()
+        if norm not in tally:
+            tally[norm] = [0, raw_str]
+        tally[norm][0] += 1
+        if len(raw_str) > len(tally[norm][1]):
+            tally[norm][1] = raw_str
+    return tally
+
+
+def _merge_suffix_tally(tally_a: dict, tally_b: dict) -> dict:
+    """Combines two Suffix tallies (counts add; the fullest raw
+    representation seen for each normalized key is kept) - used whenever
+    two already-built rows fold together, so frequency is tracked
+    correctly across multiple merge stages instead of being lost the
+    moment a single 'winning' display value is picked."""
+    merged = {k: list(v) for k, v in tally_a.items()}
+    for k, (count, raw) in tally_b.items():
+        if k not in merged:
+            merged[k] = [0, raw]
+        merged[k][0] += count
+        if len(raw) > len(merged[k][1]):
+            merged[k][1] = raw
+    return merged
+
+
+def _render_suffix_from_tally(tally: dict) -> str:
+    """The most frequent Suffix in a tally - ties broken by (1) the
+    fullest/longest raw representation of the tied value, then (2) which
+    tied value was seen first (dict insertion order) - both purely for
+    determinism, since a genuine tie has no other principled winner.
+    Returns '' if the tally is empty (no real Suffix seen anywhere)."""
+    if not tally:
+        return ""
+    best_key = None
+    best_count = -1
+    best_len = -1
+    for pos, (norm, (count, raw)) in enumerate(tally.items()):
+        if (count, len(raw)) > (best_count, best_len):
+            best_key, best_count, best_len = norm, count, len(raw)
+    return tally[best_key][1]
 
 
 def zip_key(v) -> str:
@@ -1438,16 +1562,21 @@ def _fold_row_into(base: dict, extra: dict) -> None:
     'Other Address', are all just semicolon_merge()'d as plain text (both
     sides already hold '; '-joined values from Phase 2's build, and neither
     side was confirmed to share a physical address with the other beyond
-    the same First+Middle+Last+Suffix Name - appending rather than
-    re-running the majority-address clustering is the safer choice for
-    this cross-group fold)."""
+    the same First+Last Name - appending rather than re-running the
+    majority-address clustering is the safer choice for this cross-group
+    fold)."""
     for col in [COL_DOCID] + OTHER_MERGE_COLS + ADDRESS_COLS + ["Other Address"]:
         base[col] = semicolon_merge([base.get(col, ""), extra.get(col, "")])
     base[COL_DOB] = _merge_dob_display(base.get(COL_DOB, ""), extra.get(COL_DOB, ""))
     base[COL_FIRST] = _merge_name_field(base[COL_FIRST], extra[COL_FIRST])
     base[COL_MIDDLE] = _merge_name_field(base.get(COL_MIDDLE, ""), extra.get(COL_MIDDLE, ""))
     base[COL_LAST] = _merge_name_field(base[COL_LAST], extra[COL_LAST])
-    base[COL_SUFFIX] = _merge_name_field(base.get(COL_SUFFIX, ""), extra.get(COL_SUFFIX, ""))
+    # Suffix: merge the underlying tallies (NOT fullest_value - see the
+    # module docstring) so frequency stays correct across this fold too,
+    # then re-render the (possibly now different) most-frequent winner.
+    base[_SUFFIX_TALLY_KEY] = _merge_suffix_tally(
+        base.get(_SUFFIX_TALLY_KEY, {}), extra.get(_SUFFIX_TALLY_KEY, {}))
+    base[COL_SUFFIX] = _render_suffix_from_tally(base[_SUFFIX_TALLY_KEY])
     base[COL_SSN] = fullest_value(
         [base.get(COL_SSN, ""), extra.get(COL_SSN, "")],
         [norm_ssn(base.get(COL_SSN, "")), norm_ssn(extra.get(COL_SSN, ""))])
@@ -1458,42 +1587,91 @@ def _fold_row_into(base: dict, extra: dict) -> None:
         or extra.get("Blank-ID Row Merged (Tie-Break)", False))
 
 
+def _address_signature(row: dict):
+    """EXACT-match address signature for a row already built by Step 4 -
+    the normalized full-address tuple (see address_key()), or None if
+    every ADDRESS_COLS field is blank. A blank address is never a real
+    signal (see _shares_nonpii_attribute()) - two rows with nothing on
+    file must never be treated as 'matching' on that nothing."""
+    raw = tuple(row.get(c, "") for c in ADDRESS_COLS)
+    key = address_key(raw)
+    return key if any(key) else None
+
+
+def _nonpii_tokens(row: dict) -> dict:
+    """{field: frozenset(tokens)} for every OTHER_MERGE_COLS field on an
+    already-built output row (values are already '; '-joined - see
+    semicolon_merge()) - used by _shares_nonpii_attribute() for Step 5's
+    common-attribute matching. A blank field naturally contributes an
+    empty frozenset, which can never overlap with anything (see
+    parse_id_tokens())."""
+    return {c: parse_id_tokens(row.get(c, "")) for c in OTHER_MERGE_COLS}
+
+
+def _shares_nonpii_attribute(blank_row: dict, filled_row: dict) -> bool:
+    """Step 5's "common Address/Email/Phone/Tags" check: True if
+    blank_row and filled_row share a REAL non-PII attribute - the EXACT
+    same full Address (see _address_signature() - an exact normalized
+    match only, no blank-tolerant/unit-suffix fuzziness), or an
+    overlapping token in ANY OTHER_MERGE_COLS field (Email, Phone,
+    Employee ID, Contact Information, Work-Related Information, Data
+    Subject Type, ... - the broadest reading of "Tags, etc.", per
+    explicit instruction). ASSUMPTION/RISK: checking every OTHER_MERGE_COLS
+    field this broadly means a coincidental shared value in a generic,
+    low-information field (e.g. the same "Data Subject Type") could link
+    two unrelated people - accepted per explicit instruction, but worth
+    knowing about. Never Address alone partially, never blank-vs-blank
+    (both signature helpers treat blank as "no signal", not a wildcard)."""
+    a1 = _address_signature(blank_row)
+    if a1 is not None and a1 == _address_signature(filled_row):
+        return True
+    blank_tokens = _nonpii_tokens(blank_row)
+    filled_tokens = _nonpii_tokens(filled_row)
+    return any(blank_tokens[c] and filled_tokens[c]
+               and not blank_tokens[c].isdisjoint(filled_tokens[c])
+               for c in OTHER_MERGE_COLS)
+
+
 def fold_blank_id_rows(known_rows: list) -> tuple:
-    """Step 5 - POST-BUILD pass over Phase 2's built rows. Groups them by
-    the exact (First Name, Middle Name, Last Name, Suffix) key (re-derived
-    via norm_name() - every row in one Phase-2 group already shares this
-    exact key, so recomputing it here reconstructs the same partition),
-    then within any partition holding 2+ rows:
+    """Step 5 - POST-BUILD pass over Phase 2's built rows: non-PII
+    consolidation. Groups them by the exact (First Name, Last Name) key
+    (re-derived via norm_name() - every row in one Phase-2 group already
+    shares this exact key, so recomputing it here reconstructs the same
+    partition - Middle Name/Suffix are NOT part of it, see module
+    docstring), then within any partition holding 2+ rows:
       - Every BLANK-ID row (none of the 6 ID fields populated) is folded
         together into ONE combined blank row FIRST, regardless of how many
-        FILLED candidates exist or whether they'll turn out to tie - two
-        blank-ID rows sharing a First+Middle+Last+Suffix Name have, by
-        definition, no ID evidence that could conflict between them, so
-        there's no reason to ever leave them as separate stragglers (this
-        also means an unresolved/ambiguous case below still reports ONE
-        reviewable row, not N).
+        FILLED candidates exist or whether they'll turn out to match/tie -
+        two blank-ID rows sharing a First+Last Name have, by definition,
+        no ID evidence that could conflict between them, so there's no
+        reason to ever leave them as separate stragglers.
       - no FILLED row anywhere in the partition: that combined blank row
-        IS the final row - First+Middle+Last+Suffix Name alone is the
-        only evidence there is, nothing is left unmerged.
+        IS the final row - First+Last Name alone is the only evidence
+        there is, nothing is left unmerged.
       - exactly one FILLED row: fold the combined blank row into it.
-      - 2+ FILLED rows: break the tie in two stages - first by evidence
-        richness (_row_evidence_score(), 0-6 ID fields populated), then,
-        if that ties, by which candidate represents the MAJORITY of
-        original rows ('Rows Merged') - a cluster of many corroborating
-        rows sharing one ID field is stronger evidence of a real identity
-        than a single stray row with a different, equally-"rich" field, so
-        size should decide before falling back to a guess. If there's a
-        single winner after both tie-breaks, fold in (flagged True in
-        'Blank-ID Row Merged (Tie-Break)'); if it's STILL tied on both
-        evidence and size, leave the combined blank row standing alone and
-        report it on the "Ambiguous Name-Group Review" sheet instead of
-        guessing.
+      - 2+ FILLED rows: FIRST, look for a filled candidate that shares a
+        REAL non-PII attribute with the combined blank row - the exact
+        same Address, or an overlapping Email/Phone/Employee ID/or any
+        other OTHER_MERGE_COLS value (see _shares_nonpii_attribute()). If
+        that resolves to EXACTLY one candidate, fold there directly (not
+        a guess - a real shared attribute). Only if that's inconclusive
+        (zero candidates share anything, OR 2+ conflictingly do) does it
+        fall back to the OLD tie-break: richest ID evidence
+        (_row_evidence_score(), 0-6 fields), then, if that ties too, the
+        MAJORITY of original rows ('Rows Merged') - "the top combined
+        entry" for this Name. A single winner from either path is flagged
+        True in 'Blank-ID Row Merged (Tie-Break)' only when the FALLBACK
+        path decided it (a real non-PII match isn't a tie-break). Only if
+        the fallback is STILL tied on both evidence and size is the
+        combined blank row left standing alone, reported on the
+        "Ambiguous Name-Group Review" sheet instead of guessed at - a rare
+        case now, since the fallback almost always produces a single "top"
+        candidate.
 
     Returns (final_rows, review_rows)."""
     groups = defaultdict(list)
     for i, row in enumerate(known_rows):
-        key = (norm_name(row[COL_FIRST]), norm_name(row.get(COL_MIDDLE, "")),
-               norm_name(row[COL_LAST]), norm_name(row.get(COL_SUFFIX, "")))
+        key = (norm_name(row[COL_FIRST]), norm_name(row[COL_LAST]))
         groups[key].append(i)
 
     absorbed = set()
@@ -1515,9 +1693,8 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
             absorbed.add(i)
 
         if not filled:
-            # No ID evidence anywhere in this First+Middle+Last+Suffix
-            # partition - nothing further to do, the combined blank row
-            # stands as-is.
+            # No ID evidence anywhere in this First+Last Name partition -
+            # nothing further to do, the combined blank row stands as-is.
             continue
 
         if len(filled) == 1:
@@ -1525,7 +1702,17 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
             absorbed.add(blank_base)
             continue
 
-        # 2+ filled candidates - tie-break stage 1: evidence richness.
+        # 2+ filled candidates - FIRST try a real non-PII match (Address/
+        # Email/Phone/Tags) before falling back to a guess.
+        nonpii_matches = [i for i in filled
+                           if _shares_nonpii_attribute(known_rows[blank_base], known_rows[i])]
+        if len(nonpii_matches) == 1:
+            _fold_row_into(known_rows[nonpii_matches[0]], known_rows[blank_base])
+            absorbed.add(blank_base)
+            continue
+
+        # Fallback ("the top combined entry"): tie-break stage 1 - evidence
+        # richness.
         ev_scores = {i: _row_evidence_score(known_rows[i]) for i in filled}
         best_ev = max(ev_scores.values())
         ev_winners = [i for i in filled if ev_scores[i] == best_ev]
@@ -1551,10 +1738,10 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
                 "Suffix": known_rows[blank_base].get(COL_SUFFIX, ""),
                 "DOCIDs": known_rows[blank_base].get(COL_DOCID, ""),
                 "Remarks": (f"{len(winners)} equally-strong filled candidates share this "
-                            f"First+Middle+Last+Suffix Name, tied on evidence "
-                            f"({best_ev} of 6 ID fields each) and on merged-row count "
-                            f"({size_scores[winners[0]]} rows each) - left unmerged, "
-                            f"needs manual review"),
+                            f"First+Last Name, sharing no distinguishing non-PII attribute, "
+                            f"tied on evidence ({best_ev} of 6 ID fields each) and on "
+                            f"merged-row count ({size_scores[winners[0]]} rows each) - "
+                            f"left unmerged, needs manual review"),
             })
 
     final_rows = [row for i, row in enumerate(known_rows) if i not in absorbed]
@@ -1567,7 +1754,10 @@ def fold_blank_id_rows(known_rows: list) -> tuple:
 #     see at a glance what actually drove a match vs. what was just
 #     appended along the way.
 # ------------------------------------------------------------
-# Name/Middle/Last/Suffix - the Phase 2 partition key itself, always first.
+# First/Last are the Phase 2 partition key; Middle/Suffix are combined
+# display attributes only (Max/most-frequent - see module docstring), not
+# part of the key - all four are still grouped together first in the
+# output for readability.
 _NAME_COLS = [COL_FIRST, COL_MIDDLE, COL_LAST, COL_SUFFIX]
 # The 6-level merge cascade's OWN evidence fields, in the SAME priority
 # order as Steps 3.1-3.6 (LEVEL_ORDER) - SSN first, Government-Issued ID
@@ -1586,7 +1776,8 @@ _META_COLS = ["Rows Merged", "Names Differ", "Blank-ID Row Merged (Tie-Break)"]
 
 def _merged_output_column_order(df_out_cols, docid_extra_cols) -> list:
     """Returns the column order for the 'Merged Notification Data' output:
-      1. Name + Middle + Last + Suffix (the Phase 2 partition key)
+      1. First/Middle/Last/Suffix (First+Last are the Phase 2 partition
+         key; Middle/Suffix are combined display attributes only)
       2. The merge cascade's own evidence fields, in cascade order (SSN,
          DOB, Driver's License, Passport, Tax ID, Government-Issued ID
          Number)
@@ -1666,7 +1857,7 @@ def main() -> None:
 
     # ---- Phase 2: Name ID Cascade (Step 3) ----
     print("Clustering (blocked comparison, strict priority levels, scoped "
-          "within exact First+Middle+Last+Suffix) ...")
+          "within exact First+Last Name) ...")
     t0 = time.monotonic()
     level_pairs, biggest_buckets = bucket_candidate_pairs(recs, known_idxs)
     total_candidates = sum(len(p) for p in level_pairs.values())
@@ -1812,7 +2003,13 @@ def main() -> None:
             row[COL_FIRST] = fullest_value([rv[first_pos]], [rec.first])
             row[COL_LAST] = fullest_value([rv[last_pos]], [rec.last])
             row[COL_MIDDLE] = fullest_value([rv[mid_pos]], [rec.mid])
-            row[COL_SUFFIX] = fullest_value([rv[suffix_pos]], [rec.suffix])
+            # Suffix: MOST FREQUENT value (not fullest) - see the module
+            # docstring and _suffix_tally_from_raw()/_render_suffix_from_
+            # tally(). The tally is internal bookkeeping only (never an
+            # output column) so frequency stays correct across later
+            # Step 5 folds too.
+            row[_SUFFIX_TALLY_KEY] = _suffix_tally_from_raw([rv[suffix_pos]])
+            row[COL_SUFFIX] = _render_suffix_from_tally(row[_SUFFIX_TALLY_KEY])
             row[COL_SSN] = fullest_value([rv[ssn_pos]], [rec.ssn])
             # Unique_ID is the source DB's own row key, not a person-
             # identity signal - keep the (only) row's value as-is, never
@@ -1852,8 +2049,11 @@ def main() -> None:
         row[COL_LAST] = fullest_value(last_vals, [rec.last for rec in sub_recs])
         row[COL_MIDDLE] = fullest_value([r[mid_pos] for r in sub_rows],
                                          [rec.mid for rec in sub_recs])
+        # Suffix: MOST FREQUENT value across every row in this group, not
+        # fullest - see the module docstring and _suffix_tally_from_raw().
         suffix_vals = [r[suffix_pos] for r in sub_rows]
-        row[COL_SUFFIX] = fullest_value(suffix_vals, [rec.suffix for rec in sub_recs])
+        row[_SUFFIX_TALLY_KEY] = _suffix_tally_from_raw(suffix_vals)
+        row[COL_SUFFIX] = _render_suffix_from_tally(row[_SUFFIX_TALLY_KEY])
         ssn_vals = [r[ssn_pos] for r in sub_rows]
         row[COL_SSN] = fullest_value(ssn_vals, [rec.ssn for rec in sub_recs])
         # Unique_ID: keep the FIRST (topmost) original row's value only -
@@ -1874,9 +2074,10 @@ def main() -> None:
 
     print(f"  Output built. ({time.monotonic() - t0:.1f}s)")
 
-    # ---- Phase 3: Blank-ID Fold (Step 5) ----
-    print("Folding blank-ID rows into their First+Middle+Last+Suffix's "
-          "filled row(s) (Step 5) ...")
+    # ---- Phase 3: Non-PII Consolidation (Step 5) ----
+    print("Consolidating blank-ID rows into their First+Last Name's "
+          "filled row(s) via shared non-PII attributes, then evidence "
+          "(Step 5) ...")
     t0 = time.monotonic()
     known_rows, ambiguous_review = fold_blank_id_rows(known_rows)
     print(f"  {len(known_rows):,} row(s) remain after Phase 3. "
@@ -1884,8 +2085,8 @@ def main() -> None:
     if ambiguous_review:
         print(f"  {len(ambiguous_review):,} blank-ID row(s) left unmerged - "
               f"tied on evidence between 2+ filled candidates sharing the "
-              f"same First+Middle+Last+Suffix. See the 'Ambiguous "
-              f"Name-Group Review' sheet.")
+              f"same First+Last Name with no distinguishing non-PII "
+              f"attribute. See the 'Ambiguous Name-Group Review' sheet.")
 
     # ---- DOCID overflow split - runs once, on the FINAL row set, so a
     #      DOCID list gained via Phase 3 folding is chunked correctly. ----
